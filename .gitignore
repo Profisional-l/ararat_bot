@@ -1,0 +1,6 @@
+credentials.json
+araratbot-*.json
+.env
+consent_pd_log.csv
+__pycache__/
+*.pyc
