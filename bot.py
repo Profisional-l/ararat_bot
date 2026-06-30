@@ -36,7 +36,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -60,7 +60,15 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ================== Настройки / конфигурация ==================
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '').strip()
-PRIVACY_POLICY_URL = os.getenv('PRIVACY_POLICY_URL', '').strip()
+PRIVACY_POLICY_FILE = os.getenv(
+    'PRIVACY_POLICY_FILE',
+    'docs/Положение_о_политике_в_отношении_обработки_персональных_данных.pdf',
+).strip()
+CONSENT_FORM_FILE = os.getenv(
+    'CONSENT_FORM_FILE',
+    'docs/Soglasie_na_obrabotku_personalnyh_dannyh_Платформа.pdf',
+).strip()
+CONSENT_DOCUMENT_VERSION = os.getenv('CONSENT_DOCUMENT_VERSION', '1').strip()
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE', 'credentials.json').strip()
 CONSENT_LOG_FILE = os.getenv('CONSENT_LOG_FILE', 'consent_pd_log.csv').strip()
 ADMIN_IDS_RAW = os.getenv('ADMIN_IDS', '').strip()
@@ -71,6 +79,13 @@ WELCOME_TEXT = os.getenv(
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_asset_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
+
 
 ADMIN_IDS: Set[int] = set()
 for part in ADMIN_IDS_RAW.split(','):
@@ -90,6 +105,136 @@ logger = logging.getLogger(__name__)
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+MONTHS_GENITIVE = (
+    '',
+    'января',
+    'февраля',
+    'марта',
+    'апреля',
+    'мая',
+    'июня',
+    'июля',
+    'августа',
+    'сентября',
+    'октября',
+    'ноября',
+    'декабря',
+)
+WEEKDAYS_RU = (
+    'понедельник',
+    'вторник',
+    'среда',
+    'четверг',
+    'пятница',
+    'суббота',
+    'воскресенье',
+)
+EXCURSION_DATETIME_FORMATS = (
+    '%Y-%m-%d %H:%M',
+    '%Y-%m-%d %H:%M:%S',
+    '%Y-%m-%dT%H:%M',
+    '%Y-%m-%d',
+    '%d.%m.%Y %H:%M',
+    '%d.%m.%Y %H:%M:%S',
+    '%d.%m.%Y',
+)
+EXCURSION_TIME_FORMATS = ('%H:%M', '%H:%M:%S', '%H.%M')
+
+
+def _parse_excursion_time(raw: str) -> Optional[datetime]:
+    normalized = raw.strip().replace(' ', ':')
+    if not normalized:
+        return None
+    for fmt in EXCURSION_TIME_FORMATS:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    digits = re.sub(r'\D', '', normalized)
+    if len(digits) == 4 and digits.isdigit():
+        return datetime.strptime(f'{digits[:2]}:{digits[2:]}', '%H:%M')
+    return None
+
+
+def parse_excursion_datetime(date_raw: str, time_raw: str = '') -> Optional[datetime]:
+    date_raw = date_raw.strip()
+    time_raw = time_raw.strip()
+    if not date_raw:
+        return None
+
+    combined = f'{date_raw} {time_raw}'.strip()
+    for fmt in EXCURSION_DATETIME_FORMATS:
+        try:
+            return datetime.strptime(combined, fmt)
+        except ValueError:
+            continue
+
+    if time_raw:
+        time_part = _parse_excursion_time(time_raw)
+        if time_part is None:
+            return None
+        for date_fmt in ('%Y-%m-%d', '%d.%m.%Y'):
+            try:
+                date_part = datetime.strptime(date_raw, date_fmt)
+                return date_part.replace(hour=time_part.hour, minute=time_part.minute, second=0, microsecond=0)
+            except ValueError:
+                continue
+    return None
+
+
+def excursion_has_time(date_raw: str, time_raw: str = '') -> bool:
+    if time_raw.strip():
+        return True
+    for fmt in EXCURSION_DATETIME_FORMATS:
+        if '%H' not in fmt:
+            continue
+        try:
+            datetime.strptime(date_raw.strip(), fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def normalize_excursion_key(date_raw: str, time_raw: str = '') -> str:
+    parsed = parse_excursion_datetime(date_raw, time_raw)
+    if parsed is None:
+        if time_raw.strip():
+            return f'{date_raw.strip()} {time_raw.strip()}'
+        return date_raw.strip()
+    if excursion_has_time(date_raw, time_raw):
+        return parsed.strftime('%Y-%m-%d %H:%M')
+    return parsed.strftime('%Y-%m-%d')
+
+
+def format_excursion_label(label: str) -> str:
+    label = label.strip()
+    if not label:
+        return label
+
+    if ' ' in label:
+        date_part, time_part = label.split(None, 1)
+    else:
+        date_part, time_part = label, ''
+
+    parsed = parse_excursion_datetime(date_part, time_part)
+    if parsed is None:
+        return label
+
+    day = parsed.day
+    month = MONTHS_GENITIVE[parsed.month]
+    weekday = WEEKDAYS_RU[parsed.weekday()]
+    if excursion_has_time(date_part, time_part):
+        time_str = parsed.strftime('%H:%M')
+        return f'{day} {month} ({weekday}, {time_str})'
+    return f'{day} {month} ({weekday})'
+
+
+def excursion_sort_key(label: str) -> datetime:
+    parsed = parse_excursion_datetime(label)
+    return parsed or datetime.max.replace(tzinfo=None)
 
 
 BELARUS_MOBILE_CODES = ('25', '29', '33', '44')
@@ -128,13 +273,21 @@ def validate_config() -> None:
     required = {
         'BOT_TOKEN': BOT_TOKEN,
         'SPREADSHEET_ID': SPREADSHEET_ID,
-        'PRIVACY_POLICY_URL': PRIVACY_POLICY_URL,
         'SERVICE_ACCOUNT_FILE': SERVICE_ACCOUNT_FILE,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
         logger.error('Не заданы обязательные переменные окружения: %s', ', '.join(missing))
         raise SystemExit('Установите обязательные переменные окружения перед запуском бота.')
+
+    for env_name, file_path in (
+        ('PRIVACY_POLICY_FILE', PRIVACY_POLICY_FILE),
+        ('CONSENT_FORM_FILE', CONSENT_FORM_FILE),
+    ):
+        resolved = resolve_asset_path(file_path)
+        if not os.path.exists(resolved):
+            logger.error('Не найден файл %s: %s', env_name, resolved)
+            raise SystemExit(f'Поместите PDF-документ по пути {resolved} или укажите другой путь в {env_name}.')
 
 
 validate_config()
@@ -199,6 +352,7 @@ async def run_with_status(
 @dataclass
 class ExcursionDate:
     label: str
+    display_label: str
     max_slots: Optional[int]
     booked: int
 
@@ -266,10 +420,10 @@ def _open_spreadsheet():
 
 WORKSHEET_TEMPLATES = {
     'Dates': [
-        ['date', 'max_slots'],
-        ['2026-07-10', '15'],
-        ['2026-07-12', '20'],
-        ['2026-07-15', '15'],
+        ['date', 'max_slots', 'time'],
+        ['2026-07-10', '15', '18:00'],
+        ['2026-07-12', '20', '12:00'],
+        ['2026-07-15', '15', '18:00'],
     ],
     'Submissions': [
         [
@@ -315,7 +469,7 @@ def get_worksheet(title: str):
 
 def _is_header_row(value: str) -> bool:
     normalized = value.strip().lower()
-    return normalized in {'date', 'дата', 'title', 'заголовок', 'user_id'}
+    return normalized in {'date', 'дата', 'title', 'заголовок', 'user_id', 'time', 'время'}
 
 
 def _parse_max_slots(raw_value: str) -> Optional[int]:
@@ -351,14 +505,27 @@ def read_available_dates() -> List[ExcursionDate]:
     for index, row in enumerate(rows):
         if not row or not row[0].strip():
             continue
-        label = row[0].strip()
-        if index == 0 and _is_header_row(label):
+        date_raw = row[0].strip()
+        if index == 0 and _is_header_row(date_raw):
             continue
 
+        time_raw = row[2].strip() if len(row) > 2 else ''
+        if _is_header_row(time_raw):
+            time_raw = ''
+
+        label = normalize_excursion_key(date_raw, time_raw)
         max_slots = _parse_max_slots(row[1]) if len(row) > 1 else None
         booked = booking_counts.get(label, 0)
-        dates.append(ExcursionDate(label=label, max_slots=max_slots, booked=booked))
+        dates.append(
+            ExcursionDate(
+                label=label,
+                display_label=format_excursion_label(label),
+                max_slots=max_slots,
+                booked=booked,
+            )
+        )
 
+    dates.sort(key=lambda item: excursion_sort_key(item.label))
     logger.info('Найдено дат: %s', len(dates))
     return dates
 
@@ -610,9 +777,31 @@ def log_pd_consent(user_id: int, username: str, timestamp: str) -> None:
     with open(CONSENT_LOG_FILE, mode='a', encoding='utf-8', newline='') as csvfile:
         writer = csv.writer(csvfile)
         if not file_exists:
-            writer.writerow(['user_id', 'username', 'consent_pd_timestamp'])
-        writer.writerow([user_id, username or '', timestamp])
+            writer.writerow(['user_id', 'username', 'consent_pd_timestamp', 'document_version'])
+        writer.writerow([user_id, username or '', timestamp, CONSENT_DOCUMENT_VERSION])
     logger.info('Согласие ПДн записано локально в %s', CONSENT_LOG_FILE)
+
+
+def consent_pd_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text='📋 Политика конфиденциальности', callback_data='show_privacy_policy')
+    builder.button(text='📝 Форма согласия', callback_data='show_consent_form')
+    builder.button(text='✅ Даю согласие', callback_data='consent_pd_yes')
+    builder.button(text='❌ Не согласен', callback_data='consent_pd_no')
+    builder.adjust(2, 1, 1)
+    return builder.as_markup()
+
+
+async def send_legal_pdf(target: Message, file_path: str, caption: str) -> bool:
+    resolved = resolve_asset_path(file_path)
+    if not os.path.exists(resolved):
+        logger.error('PDF-документ не найден: %s', resolved)
+        await target.answer('Документ временно недоступен. Попробуйте позже.')
+        return False
+
+    async with show_typing(target.chat.id, ChatAction.UPLOAD_DOCUMENT):
+        await target.answer_document(document=FSInputFile(resolved), caption=caption)
+    return True
 
 
 # ================== UI helpers ==================
@@ -762,12 +951,6 @@ async def buffer_media_group_broadcast(message: Message, state: FSMContext) -> N
     _broadcast_album_tasks[group_id] = asyncio.create_task(process_album(group_id))
 
 
-def resolve_asset_path(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-    return os.path.join(BASE_DIR, path)
-
-
 def get_welcome_photo() -> Optional[Union[FSInputFile, URLInputFile]]:
     if WELCOME_IMAGE_FILE:
         image_path = resolve_asset_path(WELCOME_IMAGE_FILE)
@@ -799,6 +982,23 @@ async def send_welcome(target: Message) -> None:
 
 async def send_main_menu(target: Message, text: str = 'Выберите действие:') -> None:
     await target.answer(text, reply_markup=main_menu_keyboard())
+
+
+async def send_main_menu_to_chat(chat_id: int, text: str = 'Выберите действие:') -> None:
+    await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+async def navigate_to_main_menu(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
+    await state.clear()
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        if event.message:
+            await send_main_menu(event.message)
+        else:
+            await send_main_menu_to_chat(event.from_user.id)
+        return
+
+    await send_main_menu(event)
 
 
 async def show_content_menu(target: Message) -> None:
@@ -848,10 +1048,10 @@ def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardM
     builder = InlineKeyboardBuilder()
     for item in available_dates:
         if item.max_slots is None:
-            button_text = item.label
+            button_text = item.display_label
         else:
             free_slots = item.max_slots - item.booked
-            button_text = f'{item.label} (осталось {free_slots})'
+            button_text = f'{item.display_label} (Осталось: {free_slots})'
         builder.button(text=button_text, callback_data=f'date_{item.label}')
     builder.button(text='Назад в меню', callback_data='main_menu')
     builder.adjust(1)
@@ -948,8 +1148,9 @@ async def show_my_bookings(target: Message, user_id: int) -> None:
     lines = ['<b>Мои записи на экскурсии:</b>']
     for index, booking in enumerate(bookings, start=1):
         phone_display = format_belarus_phone(booking.phone) if booking.phone else '—'
+        date_display = format_excursion_label(booking.chosen_date)
         lines.append(
-            f'\n{index}. <b>{booking.chosen_date}</b>\n'
+            f'\n{index}. <b>{date_display}</b>\n'
             f'Имя: {booking.name}\n'
             f'Телефон: {phone_display}'
         )
@@ -1013,9 +1214,9 @@ async def cmd_stats(message: Message) -> None:
     lines = ['<b>Статистика по датам:</b>']
     for item in dates:
         if item.max_slots is None:
-            lines.append(f'• {item.label}: записано {item.booked}')
+            lines.append(f'• {item.display_label}: записано {item.booked}')
         else:
-            lines.append(f'• {item.label}: {item.booked}/{item.max_slots}')
+            lines.append(f'• {item.display_label}: {item.booked}/{item.max_slots}')
     await message.answer('\n'.join(lines))
 
 
@@ -1026,11 +1227,9 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
-@dp.callback_query(F.data == 'main_menu')
+@dp.callback_query(F.data == 'main_menu', StateFilter('*'))
 async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await send_main_menu(callback.message)
-    await callback.answer()
+    await navigate_to_main_menu(callback, state)
 
 
 @dp.callback_query(F.data == 'about_project')
@@ -1081,15 +1280,32 @@ async def callback_age_confirm(callback: CallbackQuery, state: FSMContext) -> No
     username = callback.from_user.username or ''
     await run_sync(upsert_user_profile, user_id, username, age_confirmed_at=consent_ts)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='Согласен на обработку ПДн', callback_data='consent_pd_yes')],
-        [InlineKeyboardButton(text='Не согласен', callback_data='consent_pd_no')],
-    ])
     await callback.message.answer(
-        f'Для продолжения ознакомьтесь с <a href="{PRIVACY_POLICY_URL}">политикой обработки персональных данных</a> и дайте согласие.',
-        reply_markup=keyboard,
+        'Для продолжения ознакомьтесь с документами и дайте согласие на обработку персональных данных.\n\n'
+        'Нажмите кнопки ниже, чтобы открыть PDF прямо в чате.',
+        reply_markup=consent_pd_keyboard(),
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == 'show_privacy_policy')
+async def callback_show_privacy_policy(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await send_legal_pdf(
+        callback.message,
+        PRIVACY_POLICY_FILE,
+        'Положение о политике в отношении обработки персональных данных',
+    )
+
+
+@dp.callback_query(F.data == 'show_consent_form')
+async def callback_show_consent_form(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await send_legal_pdf(
+        callback.message,
+        CONSENT_FORM_FILE,
+        'Согласие на обработку персональных данных',
+    )
 
 
 @dp.callback_query(F.data == 'consent_pd_no')
@@ -1114,7 +1330,7 @@ async def callback_consent_pd_yes(callback: CallbackQuery, state: FSMContext) ->
     try:
         profile = await run_with_status(
             callback.message,
-            'Сохраняем согласие…😈',
+            'Сохраняем согласие…',
             upsert_user_profile,
             user_id,
             username,
@@ -1218,7 +1434,8 @@ async def callback_choose_date(callback: CallbackQuery, state: FSMContext) -> No
         return
 
     await state.update_data(chosen_date=chosen_date)
-    await callback.message.answer(f'Вы выбрали дату: {chosen_date}. Пожалуйста, введите своё имя.')
+    date_display = excursion.display_label
+    await callback.message.answer(f'Вы выбрали: <b>{date_display}</b>. Пожалуйста, введите своё имя.')
     await state.set_state(BookingStates.waiting_name)
 
 
@@ -1310,8 +1527,9 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         await send_dates_menu(message, message_text='Выберите другую дату:')
         return
 
+    date_display = format_excursion_label(chosen_date)
     await message.answer(
-        f'Вы записаны на экскурсию <b>{chosen_date}</b>.\nИмя: {name}\nТелефон: {phone_display}',
+        f'Вы записаны на экскурсию <b>{date_display}</b>.\nИмя: {name}\nТелефон: {phone_display}',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='Записаться ещё', callback_data='new_submission')],
             [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
@@ -1353,8 +1571,8 @@ async def process_broadcast_content(message: Message, state: FSMContext) -> None
 
 
 @dp.message()
-async def fallback_message(message: Message) -> None:
-    await message.answer('Используйте /start, чтобы открыть главное меню.')
+async def fallback_message(message: Message, state: FSMContext) -> None:
+    await navigate_to_main_menu(message, state)
 
 
 if __name__ == '__main__':

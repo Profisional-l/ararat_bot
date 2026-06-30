@@ -24,7 +24,9 @@ pip install -r requirements.txt
 |---|---|
 | `BOT_TOKEN` | Токен Telegram-бота от BotFather |
 | `SPREADSHEET_ID` | ID Google Spreadsheet |
-| `PRIVACY_POLICY_URL` | URL политики обработки ПДн |
+| `PRIVACY_POLICY_FILE` | Путь к PDF политики ПДн (по умолчанию `docs/Положение_о_политике_...pdf`) |
+| `CONSENT_FORM_FILE` | Путь к PDF текста согласия (по умолчанию `docs/Soglasie_na_obrabotku_...pdf`) |
+| `CONSENT_DOCUMENT_VERSION` | Версия документов для лога согласий (по умолчанию `1`) |
 | `SERVICE_ACCOUNT_FILE` | Путь к JSON-ключу сервисного аккаунта Google |
 | `ADMIN_IDS` | Telegram user_id администраторов через запятую |
 | `CONSENT_LOG_FILE` | Локальный CSV-лог согласий ПДн (по умолчанию `consent_pd_log.csv`) |
@@ -85,7 +87,7 @@ python bot.py
 ## Проверка
 
 1. `/start` → главное меню
-2. «Записаться на экскурсию» → 18+ → ПДн → дата → имя → телефон
+2. «Записаться на экскурсию» → 18+ → политика и согласие (PDF в чате) → дата → имя → телефон
 3. «О проекте» → материалы из листа `Content`
 
 ## Важно
