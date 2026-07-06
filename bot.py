@@ -3,12 +3,14 @@ import csv
 import logging
 import os
 import re
+import socket
 import ssl
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Union
+from typing import Callable, Dict, List, Optional, Set, TypeVar, Union
 
 from dotenv import load_dotenv
 
@@ -56,6 +58,7 @@ from aiogram.types import (
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from oauth2client.service_account import ServiceAccountCredentials
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 # ================== Настройки / конфигурация ==================
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
@@ -74,8 +77,16 @@ CONSENT_LOG_FILE = os.getenv('CONSENT_LOG_FILE', 'consent_pd_log.csv').strip()
 ADMIN_IDS_RAW = os.getenv('ADMIN_IDS', '').strip()
 WELCOME_TEXT = os.getenv(
     'WELCOME_TEXT',
-    'Добро пожаловать! Этот бот помогает записаться на авторскую экскурсию и узнать больше о проекте.',
+    'Друзья! Приветствуем вас в чат-боте проекта «ARARAT открывает новые грани». '
+    'Минск хранит множество легенд и интересных историй. Готовы увидеть город по-новому?',
 ).strip()
+MAIN_MENU_TEXT = os.getenv(
+    'MAIN_MENU_TEXT',
+    'Вместе с экскурсоводом Анной Богдановой мы подготовили необычный маршрут по знаковым местам города. '
+    'Интересные истории уже ждут своих слушателей, осталось только выбрать дату!',
+).strip()
+SELECT_DATE_TEXT = 'Выберите удобную дату посещения экскурсии'
+MAILING_PROMPT_TEXT = 'Хотите первыми узнавать новости проекта и получать эксклюзивные материалы?'
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -230,6 +241,22 @@ def format_excursion_label(label: str) -> str:
         time_str = parsed.strftime('%H:%M')
         return f'{day} {month} ({weekday}, {time_str})'
     return f'{day} {month} ({weekday})'
+
+
+def format_excursion_confirmation_date(label: str) -> str:
+    label = label.strip()
+    if not label:
+        return label
+
+    if ' ' in label:
+        date_part, time_part = label.split(None, 1)
+    else:
+        date_part, time_part = label, ''
+
+    parsed = parse_excursion_datetime(date_part, time_part)
+    if parsed is None:
+        return label
+    return parsed.strftime('%d-%m-%Y')
 
 
 def excursion_sort_key(label: str) -> datetime:
@@ -398,7 +425,48 @@ class AdminStates(StatesGroup):
 
 
 # ================== Google Sheets ==================
+SHEETS_RETRY_ATTEMPTS = 3
+SHEETS_RETRY_DELAY_SEC = 1.5
+
+_gspread_client: Optional[gspread.Client] = None
+_spreadsheet = None
+
+T = TypeVar('T')
+
+
+def _reset_spreadsheet_cache() -> None:
+    global _spreadsheet
+    _spreadsheet = None
+
+
+def with_sheets_retry(func: Callable[..., T]) -> Callable[..., T]:
+    def wrapper(*args, **kwargs) -> T:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, SHEETS_RETRY_ATTEMPTS + 1):
+            try:
+                return func(*args, **kwargs)
+            except (RequestsConnectionError, socket.gaierror, TimeoutError, OSError) as exc:
+                last_error = exc
+                _reset_spreadsheet_cache()
+                if attempt >= SHEETS_RETRY_ATTEMPTS:
+                    break
+                logger.warning(
+                    'Сбой сети при обращении к Google Sheets (попытка %s/%s): %s',
+                    attempt,
+                    SHEETS_RETRY_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(SHEETS_RETRY_DELAY_SEC * attempt)
+        raise last_error  # type: ignore[misc]
+
+    return wrapper
+
+
 def get_gspread_client() -> gspread.Client:
+    global _gspread_client
+    if _gspread_client is not None:
+        return _gspread_client
+
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         raise FileNotFoundError(
             f'Файл сервисного аккаунта не найден: {SERVICE_ACCOUNT_FILE}. '
@@ -410,12 +478,19 @@ def get_gspread_client() -> gspread.Client:
         'https://www.googleapis.com/auth/drive',
     ]
     credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scopes)
-    return gspread.authorize(credentials)
+    _gspread_client = gspread.authorize(credentials)
+    return _gspread_client
 
 
+@with_sheets_retry
 def _open_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
+
     client = get_gspread_client()
-    return client.open_by_key(SPREADSHEET_ID)
+    _spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    return _spreadsheet
 
 
 WORKSHEET_TEMPLATES = {
@@ -772,6 +847,19 @@ def user_needs_mailing_choice(profile: Optional[UserProfile]) -> bool:
     return not (profile.consent_mailing or '').strip()
 
 
+def user_declined_mailing(profile: Optional[UserProfile]) -> bool:
+    if not profile:
+        return False
+    return (profile.consent_mailing or '').strip() == 'declined'
+
+
+def user_is_mailing_subscriber(profile: Optional[UserProfile]) -> bool:
+    if not profile:
+        return False
+    value = (profile.consent_mailing or '').strip()
+    return bool(value) and value != 'declined'
+
+
 def log_pd_consent(user_id: int, username: str, timestamp: str) -> None:
     file_exists = os.path.exists(CONSENT_LOG_FILE)
     with open(CONSENT_LOG_FILE, mode='a', encoding='utf-8', newline='') as csvfile:
@@ -805,12 +893,32 @@ async def send_legal_pdf(target: Message, file_path: str, caption: str) -> bool:
 
 
 # ================== UI helpers ==================
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def build_main_menu_keyboard(profile: Optional[UserProfile] = None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text='Записаться на экскурсию', callback_data='book_excursion')],
         [InlineKeyboardButton(text='Мои записи', callback_data='my_bookings')],
         [InlineKeyboardButton(text='О проекте', callback_data='about_project')],
-    ])
+    ]
+    if profile and user_declined_mailing(profile):
+        rows.append([InlineKeyboardButton(text='Подписаться на рассылку', callback_data='mailing_subscribe')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return build_main_menu_keyboard()
+
+
+async def resolve_main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    if user_id is None:
+        return main_menu_keyboard()
+
+    try:
+        profile = await run_sync(get_user_profile, user_id)
+    except Exception:
+        logger.exception('Ошибка при загрузке профиля для меню')
+        return main_menu_keyboard()
+
+    return build_main_menu_keyboard(profile)
 
 
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
@@ -963,7 +1071,8 @@ def get_welcome_photo() -> Optional[Union[FSInputFile, URLInputFile]]:
 
 
 async def send_welcome(target: Message) -> None:
-    keyboard = main_menu_keyboard()
+    user_id = target.from_user.id if target.from_user else None
+    keyboard = await resolve_main_menu_keyboard(user_id)
     photo = get_welcome_photo()
 
     if photo:
@@ -971,31 +1080,41 @@ async def send_welcome(target: Message) -> None:
         try:
             async with show_typing(target.chat.id, ChatAction.UPLOAD_PHOTO):
                 await asyncio.sleep(1)
-                await target.answer_photo(photo=photo, caption=WELCOME_TEXT, reply_markup=keyboard)
+                await target.answer_photo(photo=photo, caption=WELCOME_TEXT)
         finally:
             await delete_message_safe(target.chat.id, status_msg.message_id)
+        await target.answer(MAIN_MENU_TEXT, reply_markup=keyboard)
         return
 
     async with show_typing(target.chat.id):
-        await target.answer(WELCOME_TEXT, reply_markup=keyboard)
+        await target.answer(WELCOME_TEXT)
+        await target.answer(MAIN_MENU_TEXT, reply_markup=keyboard)
 
 
-async def send_main_menu(target: Message, text: str = 'Выберите действие:') -> None:
-    await target.answer(text, reply_markup=main_menu_keyboard())
+async def send_main_menu(
+    target: Message,
+    text: str = MAIN_MENU_TEXT,
+    user_id: Optional[int] = None,
+) -> None:
+    resolved_user_id = user_id or (target.from_user.id if target.from_user else None)
+    keyboard = await resolve_main_menu_keyboard(resolved_user_id)
+    await target.answer(text, reply_markup=keyboard)
 
 
-async def send_main_menu_to_chat(chat_id: int, text: str = 'Выберите действие:') -> None:
-    await bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+async def send_main_menu_to_chat(chat_id: int, text: str = MAIN_MENU_TEXT, user_id: Optional[int] = None) -> None:
+    keyboard = await resolve_main_menu_keyboard(user_id)
+    await bot.send_message(chat_id, text, reply_markup=keyboard)
 
 
 async def navigate_to_main_menu(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
     await state.clear()
     if isinstance(event, CallbackQuery):
         await event.answer()
+        user_id = event.from_user.id
         if event.message:
-            await send_main_menu(event.message)
+            await send_main_menu(event.message, user_id=user_id)
         else:
-            await send_main_menu_to_chat(event.from_user.id)
+            await send_main_menu_to_chat(user_id, user_id=user_id)
         return
 
     await send_main_menu(event)
@@ -1003,7 +1122,7 @@ async def navigate_to_main_menu(event: Union[Message, CallbackQuery], state: FSM
 
 async def show_content_menu(target: Message) -> None:
     try:
-        items = await run_with_status(target, 'Ща расскажем о себе!', read_content_items)
+        items = await run_with_status(target, 'Сейчас расскажем о себе!', read_content_items)
     except Exception:
         logger.exception('Ошибка при чтении контента из Google Sheets')
         await target.answer('Сейчас не удалось загрузить материалы. Попробуйте позже.')
@@ -1058,7 +1177,7 @@ def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardM
     return builder.as_markup()
 
 
-async def send_dates_menu(target: Message, message_text: str = 'Выберите удобную дату экскурсии:') -> bool:
+async def send_dates_menu(target: Message, message_text: str = SELECT_DATE_TEXT) -> bool:
     try:
         dates = await run_with_status(target, 'Загружаем доступные даты…', read_available_dates)
     except Exception:
@@ -1075,7 +1194,7 @@ async def send_dates_menu(target: Message, message_text: str = 'Выберите
     return True
 
 
-async def show_dates(callback: CallbackQuery, state: FSMContext, message_text: str = 'Выберите удобную дату экскурсии:') -> None:
+async def show_dates(callback: CallbackQuery, state: FSMContext, message_text: str = SELECT_DATE_TEXT) -> None:
     await callback.answer()
     await send_dates_menu(callback.message, message_text)
 
@@ -1092,7 +1211,7 @@ async def continue_booking_for_user(
     state: FSMContext,
     user_id: int,
     username: str,
-    message_text: str = 'Выберите удобную дату экскурсии:',
+    message_text: str = SELECT_DATE_TEXT,
 ) -> None:
     await state.update_data(chosen_date=None, name=None)
     try:
@@ -1120,10 +1239,7 @@ async def continue_booking_for_user(
             [InlineKeyboardButton(text='Согласен на информационные рассылки', callback_data='mailing_yes')],
             [InlineKeyboardButton(text='Пропустить', callback_data='mailing_skip')],
         ])
-        await callback.message.answer(
-            'Хотите получать новости и материалы о проекте?',
-            reply_markup=keyboard,
-        )
+        await callback.message.answer(MAILING_PROMPT_TEXT, reply_markup=keyboard)
         await callback.answer()
         return
 
@@ -1158,6 +1274,35 @@ async def show_my_bookings(target: Message, user_id: int) -> None:
     await target.answer('\n'.join(lines), reply_markup=back_to_menu_keyboard())
 
 
+async def ensure_consent_pd_in_state(state: FSMContext, user_id: int) -> bool:
+    data = await state.get_data()
+    if data.get('consent_pd_timestamp'):
+        return True
+
+    try:
+        profile = await run_sync(get_user_profile, user_id)
+    except Exception:
+        logger.exception('Ошибка при загрузке профиля для подтверждения ПДн')
+        return False
+
+    if profile and profile.consent_pd_at:
+        await state.update_data(consent_pd_timestamp=profile.consent_pd_at)
+        return True
+
+    return False
+
+
+async def finish_mailing_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get('mailing_standalone'):
+        await state.update_data(mailing_standalone=None)
+        await callback.answer()
+        await send_main_menu(callback.message, user_id=callback.from_user.id)
+        return
+
+    await show_dates(callback, state)
+
+
 async def start_booking_flow(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1165,7 +1310,7 @@ async def start_booking_flow(callback: CallbackQuery, state: FSMContext) -> None
         [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
     ])
     await callback.message.answer(
-        'Для записи необходимо подтвердить, что вам исполнилось 18 лет.',
+        'Для продолжения подтвердите, что вам исполнилось 18 лет.',
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -1281,8 +1426,7 @@ async def callback_age_confirm(callback: CallbackQuery, state: FSMContext) -> No
     await run_sync(upsert_user_profile, user_id, username, age_confirmed_at=consent_ts)
 
     await callback.message.answer(
-        'Для продолжения ознакомьтесь с документами и дайте согласие на обработку персональных данных.\n\n'
-        'Нажмите кнопки ниже, чтобы открыть PDF прямо в чате.',
+        'Пожалуйста, ознакомьтесь с политикой обработки персональных данных и дайте согласие.',
         reply_markup=consent_pd_keyboard(),
     )
     await callback.answer()
@@ -1312,7 +1456,7 @@ async def callback_show_consent_form(callback: CallbackQuery) -> None:
 async def callback_consent_pd_no(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.answer('Без согласия на обработку персональных данных продолжить невозможно.')
-    await send_main_menu(callback.message)
+    await send_main_menu(callback.message, user_id=callback.from_user.id)
     await callback.answer()
 
 
@@ -1349,10 +1493,7 @@ async def callback_consent_pd_yes(callback: CallbackQuery, state: FSMContext) ->
             [InlineKeyboardButton(text='Согласен на информационные рассылки', callback_data='mailing_yes')],
             [InlineKeyboardButton(text='Пропустить', callback_data='mailing_skip')],
         ])
-        await callback.message.answer(
-            'Спасибо! Хотите получать новости и материалы о проекте?',
-            reply_markup=keyboard,
-        )
+        await callback.message.answer(MAILING_PROMPT_TEXT, reply_markup=keyboard)
         await callback.answer()
         return
 
@@ -1360,15 +1501,57 @@ async def callback_consent_pd_yes(callback: CallbackQuery, state: FSMContext) ->
     await show_dates(callback, state)
 
 
+@dp.callback_query(F.data == 'mailing_subscribe')
+async def callback_mailing_subscribe(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    try:
+        profile = await run_with_status(
+            callback.message,
+            'Загружаем профиль…',
+            get_user_profile,
+            user_id,
+        )
+    except Exception:
+        logger.exception('Ошибка при загрузке профиля для подписки на рассылку')
+        await callback.message.answer('Не удалось открыть подписку. Попробуйте позже.')
+        return
+
+    if not user_has_completed_onboarding(profile):
+        await callback.message.answer('Сначала пройдите регистрацию через «Записаться на экскурсию».')
+        return
+
+    if user_is_mailing_subscriber(profile):
+        await callback.message.answer(
+            'Вы уже подписаны на рассылку.',
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    if not user_declined_mailing(profile):
+        await send_main_menu(callback.message, user_id=callback.from_user.id)
+        return
+
+    await state.update_data(
+        consent_pd_timestamp=profile.consent_pd_at,
+        mailing_standalone=True,
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Согласен на информационные рассылки', callback_data='mailing_yes')],
+        [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
+    ])
+    await callback.message.answer(MAILING_PROMPT_TEXT, reply_markup=keyboard)
+
+
 @dp.callback_query(F.data.in_({'mailing_yes', 'mailing_skip'}))
 async def callback_mailing_choice(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    if 'consent_pd_timestamp' not in data:
+    user_id = callback.from_user.id
+    if not await ensure_consent_pd_in_state(state, user_id):
         await callback.message.answer('Сначала подтвердите возраст и согласие на обработку ПДн.')
         await callback.answer()
         return
 
-    user_id = callback.from_user.id
     username = callback.from_user.username or ''
 
     if callback.data == 'mailing_yes':
@@ -1387,7 +1570,9 @@ async def callback_mailing_choice(callback: CallbackQuery, state: FSMContext) ->
             await callback.message.answer('Не удалось сохранить подписку. Попробуйте позже.')
             await callback.answer()
             return
-        await callback.message.answer('Вы подписались на информационные рассылки.')
+        await callback.message.answer(
+            'Благодарим за вашу подписку! Теперь вы будете получать новости о проекте и дополнительные материалы.'
+        )
     else:
         mailing_value = 'declined'
         try:
@@ -1404,10 +1589,12 @@ async def callback_mailing_choice(callback: CallbackQuery, state: FSMContext) ->
             await callback.message.answer('Не удалось сохранить настройки. Попробуйте позже.')
             await callback.answer()
             return
-        await callback.message.answer('Вы пропустили подписку на рассылки.')
+        await callback.message.answer(
+            'Вы отказались от подписки. При желании вы сможете вернуться и оформить ее позже.'
+        )
 
     await state.update_data(consent_mailing=mailing_value)
-    await show_dates(callback, state)
+    await finish_mailing_choice(callback, state)
 
 
 @dp.callback_query(F.data.startswith('date_'))
@@ -1435,7 +1622,9 @@ async def callback_choose_date(callback: CallbackQuery, state: FSMContext) -> No
 
     await state.update_data(chosen_date=chosen_date)
     date_display = excursion.display_label
-    await callback.message.answer(f'Вы выбрали: <b>{date_display}</b>. Пожалуйста, введите своё имя.')
+    await callback.message.answer(
+        f'Вы выбрали дату: <b>{date_display}</b>\nПожалуйста, введите свое имя'
+    )
     await state.set_state(BookingStates.waiting_name)
 
 
@@ -1449,7 +1638,7 @@ async def process_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=name)
     await state.set_state(BookingStates.waiting_phone)
     await message.answer(
-        'Введите ваш телефон в белорусском формате.\n'
+        'Введите ваш телефон.\n'
         'Например: +375291234567, 80291234567 или 291234567'
     )
 
@@ -1527,9 +1716,10 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         await send_dates_menu(message, message_text='Выберите другую дату:')
         return
 
-    date_display = format_excursion_label(chosen_date)
+    date_display = format_excursion_confirmation_date(chosen_date)
     await message.answer(
-        f'Вы записаны на экскурсию <b>{date_display}</b>.\nИмя: {name}\nТелефон: {phone_display}',
+        f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
+        f'Имя: {name}\nТелефон: {phone_display}',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='Записаться ещё', callback_data='new_submission')],
             [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],

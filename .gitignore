@@ -4,3 +4,4 @@ araratbot-*.json
 consent_pd_log.csv
 __pycache__/
 *.pyc
+.serv.env
