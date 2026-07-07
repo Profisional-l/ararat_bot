@@ -33,11 +33,11 @@ def configure_ssl() -> None:
 configure_ssl()
 
 import gspread
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction, ChatType, ParseMode
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -71,6 +71,11 @@ CONSENT_FORM_FILE = os.getenv(
     'CONSENT_FORM_FILE',
     'docs/Soglasie_na_obrabotku_personalnyh_dannyh_Платформа.pdf',
 ).strip()
+MATERIALS_MAP_FILE = os.getenv(
+    'MATERIALS_MAP_FILE',
+    'docs/ARARAT Открывает новые грани.pdf',
+).strip()
+CONTENT_MENU_TEXT = 'А еще больше интересных маршрутов вы найдете в карте от ARARAT!'
 CONSENT_DOCUMENT_VERSION = os.getenv('CONSENT_DOCUMENT_VERSION', '1').strip()
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE', 'credentials.json').strip()
 CONSENT_LOG_FILE = os.getenv('CONSENT_LOG_FILE', 'consent_pd_log.csv').strip()
@@ -87,6 +92,10 @@ MAIN_MENU_TEXT = os.getenv(
 ).strip()
 SELECT_DATE_TEXT = 'Выберите удобную дату посещения экскурсии'
 MAILING_PROMPT_TEXT = 'Хотите первыми узнавать новости проекта и получать эксклюзивные материалы?'
+BOOKING_CANCELLED_TEXT = (
+    'Ваша запись отменена! Будем рады видеть вас на новых экскурсиях от ARARAT!\n'
+    'Вы также можете получить карту с авторскими маршрутами в материалах о проекте.'
+)
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -391,13 +400,6 @@ class ExcursionDate:
 
 
 @dataclass
-class ContentItem:
-    title: str
-    content_type: str
-    body: str
-
-
-@dataclass
 class UserProfile:
     user_id: int
     username: str
@@ -427,16 +429,35 @@ class AdminStates(StatesGroup):
 # ================== Google Sheets ==================
 SHEETS_RETRY_ATTEMPTS = 3
 SHEETS_RETRY_DELAY_SEC = 1.5
+PROFILE_CACHE_TTL_SEC = 60
+DATES_CACHE_TTL_SEC = 30
 
 _gspread_client: Optional[gspread.Client] = None
 _spreadsheet = None
+_worksheets: Dict[str, object] = {}
+_profile_cache: Dict[int, tuple[Optional['UserProfile'], float]] = {}
+_dates_cache: Optional[tuple[List['ExcursionDate'], float]] = None
 
 T = TypeVar('T')
 
 
 def _reset_spreadsheet_cache() -> None:
-    global _spreadsheet
+    global _spreadsheet, _worksheets, _dates_cache
     _spreadsheet = None
+    _worksheets = {}
+    _dates_cache = None
+
+
+def invalidate_user_profile_cache(user_id: Optional[int] = None) -> None:
+    if user_id is None:
+        _profile_cache.clear()
+        return
+    _profile_cache.pop(user_id, None)
+
+
+def invalidate_dates_cache() -> None:
+    global _dates_cache
+    _dates_cache = None
 
 
 def with_sheets_retry(func: Callable[..., T]) -> Callable[..., T]:
@@ -445,6 +466,21 @@ def with_sheets_retry(func: Callable[..., T]) -> Callable[..., T]:
         for attempt in range(1, SHEETS_RETRY_ATTEMPTS + 1):
             try:
                 return func(*args, **kwargs)
+            except APIError as exc:
+                if exc.response.status_code != 429:
+                    raise
+                last_error = exc
+                _reset_spreadsheet_cache()
+                if attempt >= SHEETS_RETRY_ATTEMPTS:
+                    break
+                retry_after = int(exc.response.headers.get('Retry-After', SHEETS_RETRY_DELAY_SEC * attempt * 2))
+                logger.warning(
+                    'Превышен лимит Google Sheets (попытка %s/%s), ждём %s с',
+                    attempt,
+                    SHEETS_RETRY_ATTEMPTS,
+                    retry_after,
+                )
+                time.sleep(retry_after)
             except (RequestsConnectionError, socket.gaierror, TimeoutError, OSError) as exc:
                 last_error = exc
                 _reset_spreadsheet_cache()
@@ -512,14 +548,6 @@ WORKSHEET_TEMPLATES = {
             'submission_timestamp',
         ],
     ],
-    'Content': [
-        ['title', 'type', 'body'],
-        [
-            'О бренде Ararat',
-            'text',
-            'Авторская экскурсия с дегустацией. Здесь можно добавить описание маршрута и проекта.',
-        ],
-    ],
     'MailingList': [
         ['user_id', 'username', 'subscribed_at'],
     ],
@@ -530,16 +558,21 @@ WORKSHEET_TEMPLATES = {
 
 
 def get_worksheet(title: str):
+    cached = _worksheets.get(title)
+    if cached is not None:
+        return cached
+
     spreadsheet = _open_spreadsheet()
     try:
-        return spreadsheet.worksheet(title)
+        worksheet = spreadsheet.worksheet(title)
     except WorksheetNotFound:
         logger.info('Лист "%s" не найден — создаём автоматически', title)
         worksheet = spreadsheet.add_worksheet(title=title, rows=200, cols=20)
         template_rows = WORKSHEET_TEMPLATES.get(title)
         if template_rows:
             worksheet.update(template_rows, value_input_option='USER_ENTERED')
-        return worksheet
+    _worksheets[title] = worksheet
+    return worksheet
 
 
 def _is_header_row(value: str) -> bool:
@@ -571,6 +604,10 @@ def count_bookings_by_date() -> Dict[str, int]:
 
 
 def read_available_dates() -> List[ExcursionDate]:
+    global _dates_cache
+    if _dates_cache is not None and time.monotonic() - _dates_cache[1] < DATES_CACHE_TTL_SEC:
+        return _dates_cache[0]
+
     logger.info('Чтение доступных дат из Google Sheets')
     worksheet = get_worksheet('Dates')
     rows = worksheet.get_all_values()
@@ -602,29 +639,8 @@ def read_available_dates() -> List[ExcursionDate]:
 
     dates.sort(key=lambda item: excursion_sort_key(item.label))
     logger.info('Найдено дат: %s', len(dates))
+    _dates_cache = (dates, time.monotonic())
     return dates
-
-
-def read_content_items() -> List[ContentItem]:
-    logger.info('Чтение контента из Google Sheets')
-    worksheet = get_worksheet('Content')
-    rows = worksheet.get_all_values()
-
-    items: List[ContentItem] = []
-    for index, row in enumerate(rows):
-        if len(row) < 3:
-            continue
-        title = row[0].strip()
-        content_type = row[1].strip().lower()
-        body = row[2].strip()
-        if not title or not body:
-            continue
-        if index == 0 and _is_header_row(title):
-            continue
-        items.append(ContentItem(title=title, content_type=content_type, body=body))
-
-    logger.info('Найдено материалов: %s', len(items))
-    return items
 
 
 def append_submission(
@@ -653,6 +669,8 @@ def append_submission(
         value_input_option='USER_ENTERED',
     )
     logger.info('Заявка успешно добавлена')
+    invalidate_dates_cache()
+    invalidate_user_profile_cache(user_id)
 
 
 def save_mailing_subscription(user_id: int, username: str, mailing_value: str) -> None:
@@ -747,13 +765,23 @@ def _profile_from_submissions(user_id: int) -> Optional[UserProfile]:
     )
 
 
-def get_user_profile(user_id: int) -> Optional[UserProfile]:
+def _load_user_profile(user_id: int) -> Optional[UserProfile]:
     worksheet = get_worksheet('Users')
     rows = worksheet.get_all_values()
     for row in rows[1:] if rows else []:
         if row and str(row[0]).strip() == str(user_id):
             return _row_to_user_profile(row)
     return _profile_from_submissions(user_id)
+
+
+def get_user_profile(user_id: int) -> Optional[UserProfile]:
+    cached = _profile_cache.get(user_id)
+    if cached and time.monotonic() - cached[1] < PROFILE_CACHE_TTL_SEC:
+        return cached[0]
+
+    profile = _load_user_profile(user_id)
+    _profile_cache[user_id] = (profile, time.monotonic())
+    return profile
 
 
 def upsert_user_profile(
@@ -790,6 +818,7 @@ def upsert_user_profile(
                     updated_at,
                 ]],
             )
+            invalidate_user_profile_cache(user_id)
             return profile
 
     fallback = _profile_from_submissions(user_id)
@@ -808,6 +837,7 @@ def upsert_user_profile(
         [profile.user_id, profile.username, profile.age_confirmed_at, profile.consent_pd_at, profile.consent_mailing, updated_at],
         value_input_option='USER_ENTERED',
     )
+    invalidate_user_profile_cache(user_id)
     return profile
 
 
@@ -835,6 +865,32 @@ def read_user_submissions(user_id: int) -> List[UserBooking]:
 
     bookings.sort(key=lambda item: item.submission_timestamp or item.chosen_date, reverse=True)
     return bookings
+
+
+def cancel_user_booking(user_id: int, submission_ts: str) -> Optional[UserBooking]:
+    logger.info('Отмена заявки пользователя %s', user_id)
+    worksheet = get_worksheet('Submissions')
+    rows = worksheet.get_all_values()
+    for row_index, row in enumerate(rows[1:], start=2):
+        if not row or str(row[0]).strip() != str(user_id):
+            continue
+        if len(row) < 8:
+            continue
+        row_ts = row[7].strip()
+        if row_ts != submission_ts:
+            continue
+        booking = UserBooking(
+            chosen_date=row[4].strip(),
+            name=row[5].strip() if len(row) > 5 else '',
+            phone=row[6].strip() if len(row) > 6 else '',
+            submission_timestamp=row_ts,
+        )
+        worksheet.delete_rows(row_index)
+        logger.info('Заявка пользователя %s успешно отменена', user_id)
+        invalidate_dates_cache()
+        return booking
+    logger.info('Заявка для отмены не найдена (пользователь %s)', user_id)
+    return None
 
 
 def user_has_completed_onboarding(profile: Optional[UserProfile]) -> bool:
@@ -1120,43 +1176,23 @@ async def navigate_to_main_menu(event: Union[Message, CallbackQuery], state: FSM
     await send_main_menu(event)
 
 
-async def show_content_menu(target: Message) -> None:
+async def show_project_map(target: Message) -> None:
+    back_keyboard = back_to_menu_keyboard()
+    resolved = resolve_asset_path(MATERIALS_MAP_FILE)
+    if not os.path.exists(resolved):
+        await target.answer('Карта временно недоступна. Попробуйте позже.', reply_markup=back_keyboard)
+        return
+
+    status_msg = await target.answer('Открываем карту ARARAT…')
     try:
-        items = await run_with_status(target, 'Сейчас расскажем о себе!', read_content_items)
-    except Exception:
-        logger.exception('Ошибка при чтении контента из Google Sheets')
-        await target.answer('Сейчас не удалось загрузить материалы. Попробуйте позже.')
-        return
-
-    if not items:
-        await target.answer('Материалы о проекте скоро появятся. Загляните позже.')
-        return
-
-    builder = InlineKeyboardBuilder()
-    for index, item in enumerate(items):
-        builder.button(text=item.title, callback_data=f'content_{index}')
-    builder.button(text='Назад в меню', callback_data='main_menu')
-    builder.adjust(1)
-
-    await target.answer('Материалы о проекте:', reply_markup=builder.as_markup())
-
-
-async def show_content_item(callback: CallbackQuery, item: ContentItem) -> None:
-    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='К списку материалов', callback_data='about_project')],
-        [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
-    ])
-
-    if item.content_type == 'link':
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='Открыть ссылку', url=item.body)],
-            [InlineKeyboardButton(text='К списку материалов', callback_data='about_project')],
-            [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
-        ])
-        await callback.message.answer(f'<b>{item.title}</b>\n\nСсылка на материал:', reply_markup=keyboard)
-        return
-
-    await callback.message.answer(f'<b>{item.title}</b>\n\n{item.body}', reply_markup=back_keyboard)
+        async with show_typing(target.chat.id, ChatAction.UPLOAD_DOCUMENT):
+            await target.answer_document(
+                document=FSInputFile(resolved),
+                caption=CONTENT_MENU_TEXT,
+                reply_markup=back_keyboard,
+            )
+    finally:
+        await delete_message_safe(target.chat.id, status_msg.message_id)
 
 
 def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardMarkup]:
@@ -1262,6 +1298,7 @@ async def show_my_bookings(target: Message, user_id: int) -> None:
         return
 
     lines = ['<b>Мои записи на экскурсии:</b>']
+    keyboard_rows: List[List[InlineKeyboardButton]] = []
     for index, booking in enumerate(bookings, start=1):
         phone_display = format_belarus_phone(booking.phone) if booking.phone else '—'
         date_display = format_excursion_label(booking.chosen_date)
@@ -1270,8 +1307,16 @@ async def show_my_bookings(target: Message, user_id: int) -> None:
             f'Имя: {booking.name}\n'
             f'Телефон: {phone_display}'
         )
+        if booking.submission_timestamp:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    text=f'❌ Отменить запись {index}',
+                    callback_data=f'cancel_{booking.submission_timestamp}',
+                )
+            ])
 
-    await target.answer('\n'.join(lines), reply_markup=back_to_menu_keyboard())
+    keyboard_rows.append([InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')])
+    await target.answer('\n'.join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows))
 
 
 async def ensure_consent_pd_in_state(state: FSMContext, user_id: int) -> bool:
@@ -1380,7 +1425,7 @@ async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None
 @dp.callback_query(F.data == 'about_project')
 async def callback_about_project(callback: CallbackQuery) -> None:
     await callback.answer()
-    await show_content_menu(callback.message)
+    await show_project_map(callback.message)
 
 
 @dp.callback_query(F.data == 'book_excursion')
@@ -1397,25 +1442,6 @@ async def callback_book_excursion(callback: CallbackQuery, state: FSMContext) ->
 async def callback_my_bookings(callback: CallbackQuery) -> None:
     await callback.answer()
     await show_my_bookings(callback.message, callback.from_user.id)
-
-
-@dp.callback_query(F.data.startswith('content_'))
-async def callback_content_item(callback: CallbackQuery) -> None:
-    await callback.answer()
-    try:
-        index = int(callback.data.removeprefix('content_'))
-        items = await run_with_status(
-            callback.message,
-            'Открываем материал…',
-            read_content_items,
-        )
-        item = items[index]
-    except Exception:
-        logger.exception('Ошибка при открытии материала')
-        await callback.message.answer('Материал не найден. Попробуйте снова.')
-        return
-
-    await show_content_item(callback, item)
 
 
 @dp.callback_query(F.data == 'age_confirm')
@@ -1721,11 +1747,45 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
         f'Имя: {name}\nТелефон: {phone_display}',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='❌ Отменить запись', callback_data=f'cancel_{submission_ts}')],
             [InlineKeyboardButton(text='Записаться ещё', callback_data='new_submission')],
             [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
         ]),
     )
     await state.set_state(None)
+
+
+@dp.callback_query(F.data.startswith('cancel_'), StateFilter('*'))
+async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    submission_ts = callback.data.removeprefix('cancel_')
+    user_id = callback.from_user.id
+
+    try:
+        cancelled = await run_with_status(
+            callback.message,
+            'Отменяем вашу запись…',
+            cancel_user_booking,
+            user_id,
+            submission_ts,
+        )
+    except Exception:
+        logger.exception('Ошибка при отмене записи')
+        await callback.message.answer('Не удалось отменить запись. Попробуйте позже.')
+        return
+
+    if cancelled is None:
+        await callback.message.answer(
+            'Эта запись уже отменена или не найдена.',
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Материалы о проекте', callback_data='about_project')],
+        [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
+    ])
+    await callback.message.answer(BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == 'new_submission')
@@ -1762,6 +1822,8 @@ async def process_broadcast_content(message: Message, state: FSMContext) -> None
 
 @dp.message()
 async def fallback_message(message: Message, state: FSMContext) -> None:
+    if message.chat.type != ChatType.PRIVATE:
+        return
     await navigate_to_main_menu(message, state)
 
 
