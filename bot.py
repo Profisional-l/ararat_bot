@@ -38,6 +38,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ChatType, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -74,6 +75,10 @@ CONSENT_FORM_FILE = os.getenv(
 MATERIALS_MAP_FILE = os.getenv(
     'MATERIALS_MAP_FILE',
     'docs/ARARAT Открывает новые грани.pdf',
+).strip()
+MATERIALS_MAP_TITLE = os.getenv(
+    'MATERIALS_MAP_TITLE',
+    'Карта с авторскими маршрутами от ARARAT',
 ).strip()
 CONTENT_MENU_TEXT = 'А еще больше интересных маршрутов вы найдете в карте от ARARAT!'
 CONSENT_DOCUMENT_VERSION = os.getenv('CONSENT_DOCUMENT_VERSION', '1').strip()
@@ -400,6 +405,13 @@ class ExcursionDate:
 
 
 @dataclass
+class ContentItem:
+    title: str
+    content_type: str
+    body: str
+
+
+@dataclass
 class UserProfile:
     user_id: int
     username: str
@@ -548,6 +560,9 @@ WORKSHEET_TEMPLATES = {
             'submission_timestamp',
         ],
     ],
+    'Content': [
+        ['title', 'type', 'body'],
+    ],
     'MailingList': [
         ['user_id', 'username', 'subscribed_at'],
     ],
@@ -643,6 +658,42 @@ def read_available_dates() -> List[ExcursionDate]:
     return dates
 
 
+CONTENT_IGNORED_TITLES = {'о бренде ararat'}
+
+
+def read_content_items() -> List[ContentItem]:
+    logger.info('Чтение контента из Google Sheets')
+    worksheet = get_worksheet('Content')
+    rows = worksheet.get_all_values()
+
+    items: List[ContentItem] = []
+    for index, row in enumerate(rows):
+        if len(row) < 3:
+            continue
+        title = row[0].strip()
+        content_type = row[1].strip().lower()
+        body = row[2].strip()
+        if not title or not body:
+            continue
+        if index == 0 and _is_header_row(title):
+            continue
+        if title.strip().lower() in CONTENT_IGNORED_TITLES:
+            continue
+        items.append(ContentItem(title=title, content_type=content_type, body=body))
+
+    if MATERIALS_MAP_FILE and os.path.exists(resolve_asset_path(MATERIALS_MAP_FILE)):
+        items.append(
+            ContentItem(
+                title=MATERIALS_MAP_TITLE,
+                content_type='pdf',
+                body=MATERIALS_MAP_FILE,
+            )
+        )
+
+    logger.info('Найдено материалов: %s', len(items))
+    return items
+
+
 def append_submission(
     user_id: int,
     username: str,
@@ -732,6 +783,35 @@ def read_mailing_subscribers() -> List[int]:
             continue
         subscribers.append(int(row[0]))
     return subscribers
+
+
+def remove_mailing_subscriber(user_id: int) -> bool:
+    worksheet = get_worksheet('MailingList')
+    rows = worksheet.get_all_values()
+    for row_index, row in enumerate(rows[1:], start=2):
+        if row and str(row[0]).strip() == str(user_id):
+            worksheet.delete_rows(row_index)
+            invalidate_user_profile_cache(user_id)
+            logger.info('Подписчик %s удалён из списка рассылки', user_id)
+            return True
+    return False
+
+
+def is_unreachable_subscriber_error(exc: Exception) -> bool:
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    if isinstance(exc, TelegramBadRequest):
+        message = (exc.message or '').lower()
+        return any(
+            phrase in message
+            for phrase in (
+                'chat not found',
+                'user is deactivated',
+                'bot was blocked by the user',
+                'peer_id_invalid',
+            )
+        )
+    return False
 
 
 def _row_to_user_profile(row: List[str]) -> UserProfile:
@@ -1033,9 +1113,10 @@ async def send_broadcast_to_subscribers(
     source_message: Message,
     subscribers: List[int],
     album_messages: Optional[List[Message]] = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     sent = 0
     failed = 0
+    removed = 0
     album_media = build_album_media(album_messages) if album_messages else None
 
     for user_id in subscribers:
@@ -1049,12 +1130,21 @@ async def send_broadcast_to_subscribers(
                     message_id=source_message.message_id,
                 )
             sent += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
-            logger.exception('Не удалось отправить рассылку пользователю %s', user_id)
+            if is_unreachable_subscriber_error(exc):
+                logger.warning(
+                    'Подписчик %s недоступен для рассылки (%s), удаляем из списка',
+                    user_id,
+                    exc.message if hasattr(exc, 'message') else exc,
+                )
+                if await run_sync(remove_mailing_subscriber, user_id):
+                    removed += 1
+            else:
+                logger.exception('Не удалось отправить рассылку пользователю %s', user_id)
         await asyncio.sleep(0.05)
 
-    return sent, failed
+    return sent, failed, removed
 
 
 async def execute_broadcast(
@@ -1082,11 +1172,14 @@ async def execute_broadcast(
 
     status_msg = await message.answer('Отправляем рассылку подписчикам…')
     async with show_typing(message.chat.id):
-        sent, failed = await send_broadcast_to_subscribers(message, subscribers, album_messages)
+        sent, failed, removed = await send_broadcast_to_subscribers(message, subscribers, album_messages)
 
     await delete_message_safe(message.chat.id, status_msg.message_id)
     album_note = ' (альбом)' if album_messages else ''
-    await message.answer(f'Рассылка{album_note} завершена. Успешно: {sent}, ошибок: {failed}.')
+    removed_note = f', удалено из списка: {removed}' if removed else ''
+    await message.answer(
+        f'Рассылка{album_note} завершена. Успешно: {sent}, ошибок: {failed}{removed_note}.'
+    )
     await state.clear()
 
 
@@ -1136,20 +1229,22 @@ async def send_welcome(target: Message) -> None:
         try:
             async with show_typing(target.chat.id, ChatAction.UPLOAD_PHOTO):
                 await asyncio.sleep(1)
-                await target.answer_photo(photo=photo, caption=WELCOME_TEXT)
+                await target.answer_photo(
+                    photo=photo,
+                    caption=WELCOME_TEXT,
+                    reply_markup=keyboard,
+                )
         finally:
             await delete_message_safe(target.chat.id, status_msg.message_id)
-        await target.answer(MAIN_MENU_TEXT, reply_markup=keyboard)
         return
 
     async with show_typing(target.chat.id):
-        await target.answer(WELCOME_TEXT)
-        await target.answer(MAIN_MENU_TEXT, reply_markup=keyboard)
+        await target.answer(WELCOME_TEXT, reply_markup=keyboard)
 
 
 async def send_main_menu(
     target: Message,
-    text: str = MAIN_MENU_TEXT,
+    text: str = 'Выберите действие:',
     user_id: Optional[int] = None,
 ) -> None:
     resolved_user_id = user_id or (target.from_user.id if target.from_user else None)
@@ -1157,7 +1252,7 @@ async def send_main_menu(
     await target.answer(text, reply_markup=keyboard)
 
 
-async def send_main_menu_to_chat(chat_id: int, text: str = MAIN_MENU_TEXT, user_id: Optional[int] = None) -> None:
+async def send_main_menu_to_chat(chat_id: int, text: str = 'Выберите действие:', user_id: Optional[int] = None) -> None:
     keyboard = await resolve_main_menu_keyboard(user_id)
     await bot.send_message(chat_id, text, reply_markup=keyboard)
 
@@ -1176,23 +1271,40 @@ async def navigate_to_main_menu(event: Union[Message, CallbackQuery], state: FSM
     await send_main_menu(event)
 
 
-async def show_project_map(target: Message) -> None:
-    back_keyboard = back_to_menu_keyboard()
-    resolved = resolve_asset_path(MATERIALS_MAP_FILE)
-    if not os.path.exists(resolved):
-        await target.answer('Карта временно недоступна. Попробуйте позже.', reply_markup=back_keyboard)
+async def show_content_menu(target: Message) -> None:
+    await target.answer(MAIN_MENU_TEXT, reply_markup=back_to_menu_keyboard())
+
+
+async def send_project_materials(target: Message) -> None:
+    try:
+        items = await run_with_status(target, 'Открываем материалы…', read_content_items)
+    except Exception:
+        logger.exception('Ошибка при чтении контента из Google Sheets')
+        await target.answer('Сейчас не удалось загрузить материалы. Попробуйте позже.')
         return
 
-    status_msg = await target.answer('Открываем карту ARARAT…')
-    try:
-        async with show_typing(target.chat.id, ChatAction.UPLOAD_DOCUMENT):
-            await target.answer_document(
-                document=FSInputFile(resolved),
-                caption=CONTENT_MENU_TEXT,
-                reply_markup=back_keyboard,
-            )
-    finally:
-        await delete_message_safe(target.chat.id, status_msg.message_id)
+    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
+    ])
+
+    await target.answer(CONTENT_MENU_TEXT)
+
+    if not items:
+        await target.answer('Материалы о проекте скоро появятся. Загляните позже.', reply_markup=back_keyboard)
+        return
+
+    for item in items:
+        if item.content_type == 'pdf':
+            await send_legal_pdf(target, item.body, item.title)
+        elif item.content_type == 'link':
+            link_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='Открыть ссылку', url=item.body)],
+            ])
+            await target.answer(f'<b>{item.title}</b>', reply_markup=link_keyboard)
+        else:
+            await target.answer(f'<b>{item.title}</b>\n\n{item.body}')
+
+    await target.answer('Приятного просмотра!', reply_markup=back_keyboard)
 
 
 def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardMarkup]:
@@ -1425,7 +1537,13 @@ async def callback_main_menu(callback: CallbackQuery, state: FSMContext) -> None
 @dp.callback_query(F.data == 'about_project')
 async def callback_about_project(callback: CallbackQuery) -> None:
     await callback.answer()
-    await show_project_map(callback.message)
+    await show_content_menu(callback.message)
+
+
+@dp.callback_query(F.data == 'project_materials')
+async def callback_project_materials(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await send_project_materials(callback.message)
 
 
 @dp.callback_query(F.data == 'book_excursion')
@@ -1745,11 +1863,14 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     date_display = format_excursion_confirmation_date(chosen_date)
     await message.answer(
         f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
-        f'Имя: {name}\nТелефон: {phone_display}',
+        f'Имя: {name}\nТелефон: {phone_display}\n'
+        'Экскурсовод свяжется с вами, чтобы сообщить место сбора.\n'
+        'До встречи!',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='❌ Отменить запись', callback_data=f'cancel_{submission_ts}')],
-            [InlineKeyboardButton(text='Записаться ещё', callback_data='new_submission')],
+            [InlineKeyboardButton(text='Записаться еще', callback_data='new_submission')],
+            [InlineKeyboardButton(text='Отменить запись', callback_data=f'cancel_{submission_ts}')],
             [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
+            [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
         ]),
     )
     await state.set_state(None)
@@ -1782,7 +1903,7 @@ async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) ->
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='Материалы о проекте', callback_data='about_project')],
+        [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
         [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
     ])
     await callback.message.answer(BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
