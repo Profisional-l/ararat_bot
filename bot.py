@@ -96,6 +96,10 @@ MAIN_MENU_TEXT = os.getenv(
     'Интересные истории уже ждут своих слушателей, осталось только выбрать дату!',
 ).strip()
 SELECT_DATE_TEXT = 'Выберите удобную дату посещения экскурсии'
+NO_SUITABLE_DATE_TEXT = (
+    'Не нашли подходящую дату? Вы можете пройти экскурсию самостоятельно! '
+    'Еще больше интересных маршрутов вы найдете в карте от ARARAT!'
+)
 MAILING_PROMPT_TEXT = 'Хотите первыми узнавать новости проекта и получать эксклюзивные материалы?'
 BOOKING_CANCELLED_TEXT = (
     'Ваша запись отменена! Будем рады видеть вас на новых экскурсиях от ARARAT!\n'
@@ -1307,6 +1311,18 @@ async def send_project_materials(target: Message) -> None:
     await target.answer('Приятного просмотра!', reply_markup=back_keyboard)
 
 
+async def send_no_suitable_date_materials(target: Message) -> None:
+    back_keyboard = back_to_menu_keyboard()
+    await target.answer(NO_SUITABLE_DATE_TEXT)
+
+    if not MATERIALS_MAP_FILE or not os.path.exists(resolve_asset_path(MATERIALS_MAP_FILE)):
+        await target.answer('Карта временно недоступна. Попробуйте позже.', reply_markup=back_keyboard)
+        return
+
+    await send_legal_pdf(target, MATERIALS_MAP_FILE, MATERIALS_MAP_TITLE)
+    await target.answer('Приятного просмотра!', reply_markup=back_keyboard)
+
+
 def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardMarkup]:
     available_dates = [item for item in dates if not item.is_full]
     if not available_dates:
@@ -1320,6 +1336,7 @@ def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardM
             free_slots = item.max_slots - item.booked
             button_text = f'{item.display_label} (Осталось: {free_slots})'
         builder.button(text=button_text, callback_data=f'date_{item.label}')
+    builder.button(text='Нет подходящей даты', callback_data='no_suitable_date')
     builder.button(text='Назад в меню', callback_data='main_menu')
     builder.adjust(1)
     return builder.as_markup()
@@ -1739,6 +1756,12 @@ async def callback_mailing_choice(callback: CallbackQuery, state: FSMContext) ->
 
     await state.update_data(consent_mailing=mailing_value)
     await finish_mailing_choice(callback, state)
+
+
+@dp.callback_query(F.data == 'no_suitable_date')
+async def callback_no_suitable_date(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await send_no_suitable_date_materials(callback.message)
 
 
 @dp.callback_query(F.data.startswith('date_'))
