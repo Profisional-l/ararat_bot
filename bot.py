@@ -105,6 +105,10 @@ BOOKING_CANCELLED_TEXT = (
     'Ваша запись отменена! Будем рады видеть вас на новых экскурсиях от ARARAT!\n'
     'Вы также можете получить карту с авторскими маршрутами в материалах о проекте.'
 )
+EXCURSION_MEETING_PLACE = os.getenv(
+    'EXCURSION_MEETING_PLACE',
+    'у кафе «Осмоловка» (ул. Киселева, 23)',
+).strip()
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -275,6 +279,39 @@ def format_excursion_confirmation_date(label: str) -> str:
     if parsed is None:
         return label
     return parsed.strftime('%d-%m-%Y')
+
+
+def format_excursion_confirmation_time(label: str) -> Optional[str]:
+    label = label.strip()
+    if not label:
+        return None
+
+    if ' ' in label:
+        date_part, time_part = label.split(None, 1)
+    else:
+        date_part, time_part = label, ''
+
+    parsed = parse_excursion_datetime(date_part, time_part)
+    if parsed is None or not excursion_has_time(date_part, time_part):
+        return None
+    return parsed.strftime('%H:%M')
+
+
+def format_booking_confirmation_text(chosen_date: str, name: str, phone_display: str) -> str:
+    date_display = format_excursion_confirmation_date(chosen_date)
+    time_display = format_excursion_confirmation_time(chosen_date)
+    if time_display:
+        meeting_line = f'Будем ждать вас в {time_display}, {EXCURSION_MEETING_PLACE}'
+    else:
+        meeting_line = f'Будем ждать вас, {EXCURSION_MEETING_PLACE}'
+
+    return (
+        f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
+        f'Имя: {name}\n'
+        f'Телефон: {phone_display}\n'
+        f'{meeting_line}\n'
+        'До встречи!'
+    )
 
 
 def excursion_sort_key(label: str) -> datetime:
@@ -1883,12 +1920,8 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         await send_dates_menu(message, message_text='Выберите другую дату:')
         return
 
-    date_display = format_excursion_confirmation_date(chosen_date)
     await message.answer(
-        f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
-        f'Имя: {name}\nТелефон: {phone_display}\n'
-        'Экскурсовод свяжется с вами, чтобы сообщить место сбора.\n'
-        'До встречи!',
+        format_booking_confirmation_text(chosen_date, name, phone_display),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='Записаться еще', callback_data='new_submission')],
             [InlineKeyboardButton(text='Отменить запись', callback_data=f'cancel_{submission_ts}')],
