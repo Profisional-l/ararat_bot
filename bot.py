@@ -74,13 +74,15 @@ CONSENT_FORM_FILE = os.getenv(
 ).strip()
 MATERIALS_MAP_FILE = os.getenv(
     'MATERIALS_MAP_FILE',
-    'docs/ARARAT Открывает новые грани.pdf',
+    'docs/ARARAT_открывает_новые_грани_города_.pdf',
 ).strip()
 MATERIALS_MAP_TITLE = os.getenv(
     'MATERIALS_MAP_TITLE',
     'Карта с авторскими маршрутами от ARARAT',
 ).strip()
-CONTENT_MENU_TEXT = 'А еще больше интересных маршрутов вы найдете в карте от ARARAT!'
+CONTENT_MENU_TEXT = 'Еще больше интересных маршрутов вы найдете в карте от ARARAT!'
+MATERIALS_CLOSING_TEXT = 'Приятной прогулки!'
+GUIDE_INSTAGRAM_URL = 'https://www.instagram.com/bahdanava_vodit'
 CONSENT_DOCUMENT_VERSION = os.getenv('CONSENT_DOCUMENT_VERSION', '1').strip()
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE', 'credentials.json').strip()
 CONSENT_LOG_FILE = os.getenv('CONSENT_LOG_FILE', 'consent_pd_log.csv').strip()
@@ -305,11 +307,13 @@ def format_booking_confirmation_text(chosen_date: str, name: str, phone_display:
     else:
         meeting_line = f'Будем ждать вас, {EXCURSION_MEETING_PLACE}'
 
+    guide_link = f'<a href="{GUIDE_INSTAGRAM_URL}">Анной Богдановой</a>'
     return (
         f'Вы успешно записаны на экскурсию, которая пройдет {date_display}.\n'
         f'Имя: {name}\n'
         f'Телефон: {phone_display}\n'
-        f'{meeting_line}\n'
+        f'{meeting_line}\n\n'
+        f'Вопросы по экскурсии можно обсудить с {guide_link}\n'
         'До встречи!'
     )
 
@@ -414,20 +418,38 @@ async def delete_message_safe(chat_id: int, message_id: int) -> None:
         pass
 
 
+async def edit_or_answer(
+    message: Message,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> Message:
+    """Обновляет статусное сообщение на финальный текст — без рывка «удалили → прислали новое»."""
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        return await message.answer(text, reply_markup=reply_markup)
+
+
 async def run_with_status(
     target: Message,
     status_text: str,
     func,
     *args,
     action: ChatAction = ChatAction.TYPING,
+    keep_status: bool = False,
     **kwargs,
 ):
     status_msg = await target.answer(status_text)
     try:
         async with show_typing(target.chat.id, action):
-            return await run_sync(func, *args, **kwargs)
-    finally:
+            result = await run_sync(func, *args, **kwargs)
+        if keep_status:
+            return result, status_msg
         await delete_message_safe(target.chat.id, status_msg.message_id)
+        return result
+    except Exception:
+        await delete_message_safe(target.chat.id, status_msg.message_id)
+        raise
 
 
 # ================== Модели данных ==================
@@ -1269,7 +1291,6 @@ async def send_welcome(target: Message) -> None:
         status_msg = await target.answer('Ну что, сейчас познакомимся 🍹🙌🏻 !')
         try:
             async with show_typing(target.chat.id, ChatAction.UPLOAD_PHOTO):
-                await asyncio.sleep(1)
                 await target.answer_photo(
                     photo=photo,
                     caption=WELCOME_TEXT,
@@ -1318,7 +1339,12 @@ async def show_content_menu(target: Message) -> None:
 
 async def send_project_materials(target: Message) -> None:
     try:
-        items = await run_with_status(target, 'Открываем материалы…', read_content_items)
+        items, status_msg = await run_with_status(
+            target,
+            'Открываем материалы…',
+            read_content_items,
+            keep_status=True,
+        )
     except Exception:
         logger.exception('Ошибка при чтении контента из Google Sheets')
         await target.answer('Сейчас не удалось загрузить материалы. Попробуйте позже.')
@@ -1328,7 +1354,7 @@ async def send_project_materials(target: Message) -> None:
         [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
     ])
 
-    await target.answer(CONTENT_MENU_TEXT)
+    await edit_or_answer(status_msg, CONTENT_MENU_TEXT)
 
     if not items:
         await target.answer('Материалы о проекте скоро появятся. Загляните позже.', reply_markup=back_keyboard)
@@ -1345,19 +1371,23 @@ async def send_project_materials(target: Message) -> None:
         else:
             await target.answer(f'<b>{item.title}</b>\n\n{item.body}')
 
-    await target.answer('Приятного просмотра!', reply_markup=back_keyboard)
+    await target.answer(MATERIALS_CLOSING_TEXT, reply_markup=back_keyboard)
 
 
 async def send_no_suitable_date_materials(target: Message) -> None:
     back_keyboard = back_to_menu_keyboard()
-    await target.answer(NO_SUITABLE_DATE_TEXT)
+    status_msg = await target.answer(NO_SUITABLE_DATE_TEXT)
 
     if not MATERIALS_MAP_FILE or not os.path.exists(resolve_asset_path(MATERIALS_MAP_FILE)):
-        await target.answer('Карта временно недоступна. Попробуйте позже.', reply_markup=back_keyboard)
+        await edit_or_answer(
+            status_msg,
+            'Карта временно недоступна. Попробуйте позже.',
+            reply_markup=back_keyboard,
+        )
         return
 
     await send_legal_pdf(target, MATERIALS_MAP_FILE, MATERIALS_MAP_TITLE)
-    await target.answer('Приятного просмотра!', reply_markup=back_keyboard)
+    await target.answer(MATERIALS_CLOSING_TEXT, reply_markup=back_keyboard)
 
 
 def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardMarkup]:
@@ -1381,7 +1411,12 @@ def build_dates_keyboard(dates: List[ExcursionDate]) -> Optional[InlineKeyboardM
 
 async def send_dates_menu(target: Message, message_text: str = SELECT_DATE_TEXT) -> bool:
     try:
-        dates = await run_with_status(target, 'Загружаем доступные даты…', read_available_dates)
+        dates, status_msg = await run_with_status(
+            target,
+            'Загружаем доступные даты…',
+            read_available_dates,
+            keep_status=True,
+        )
     except Exception:
         logger.exception('Ошибка при чтении дат из Google Sheets')
         await target.answer('Извините, сейчас невозможна загрузка доступных дат. Попробуйте позже.')
@@ -1389,10 +1424,10 @@ async def send_dates_menu(target: Message, message_text: str = SELECT_DATE_TEXT)
 
     keyboard = build_dates_keyboard(dates)
     if keyboard is None:
-        await target.answer('Пока нет свободных дат. Пожалуйста, зайдите позже.')
+        await edit_or_answer(status_msg, 'Пока нет свободных дат. Пожалуйста, зайдите позже.')
         return False
 
-    await target.answer(message_text, reply_markup=keyboard)
+    await edit_or_answer(status_msg, message_text, reply_markup=keyboard)
     return True
 
 
@@ -1416,48 +1451,61 @@ async def continue_booking_for_user(
     message_text: str = SELECT_DATE_TEXT,
 ) -> None:
     await state.update_data(chosen_date=None, name=None)
+    status_msg = await callback.message.answer('Подготавливаем запись…')
     try:
-        profile = await run_with_status(
-            callback.message,
-            'Подготавливаем запись…',
-            get_user_profile,
-            user_id,
-        )
+        async with show_typing(callback.message.chat.id):
+            profile = await run_sync(get_user_profile, user_id)
+
+            if not user_has_completed_onboarding(profile):
+                await delete_message_safe(callback.message.chat.id, status_msg.message_id)
+                await start_booking_flow(callback, state)
+                return
+
+            await apply_profile_to_state(state, profile)
+            await run_sync(upsert_user_profile, user_id, username)
+
+            if user_needs_mailing_choice(profile):
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='Согласен на информационные рассылки', callback_data='mailing_yes')],
+                    [InlineKeyboardButton(text='Пропустить', callback_data='mailing_skip')],
+                ])
+                await edit_or_answer(status_msg, MAILING_PROMPT_TEXT, reply_markup=keyboard)
+                await callback.answer()
+                return
+
+            dates = await run_sync(read_available_dates)
+            keyboard = build_dates_keyboard(dates)
+            if keyboard is None:
+                await edit_or_answer(status_msg, 'Пока нет свободных дат. Пожалуйста, зайдите позже.')
+                await callback.answer()
+                return
+
+            await edit_or_answer(status_msg, message_text, reply_markup=keyboard)
+            await callback.answer()
     except Exception:
         logger.exception('Ошибка при загрузке профиля пользователя')
+        await delete_message_safe(callback.message.chat.id, status_msg.message_id)
         await callback.message.answer('Не удалось начать запись. Попробуйте позже.')
         await callback.answer()
-        return
-
-    if not user_has_completed_onboarding(profile):
-        await start_booking_flow(callback, state)
-        return
-
-    await apply_profile_to_state(state, profile)
-    await run_sync(upsert_user_profile, user_id, username)
-
-    if user_needs_mailing_choice(profile):
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='Согласен на информационные рассылки', callback_data='mailing_yes')],
-            [InlineKeyboardButton(text='Пропустить', callback_data='mailing_skip')],
-        ])
-        await callback.message.answer(MAILING_PROMPT_TEXT, reply_markup=keyboard)
-        await callback.answer()
-        return
-
-    await show_dates(callback, state, message_text=message_text)
 
 
 async def show_my_bookings(target: Message, user_id: int) -> None:
     try:
-        bookings = await run_with_status(target, 'Загружаем ваши записи…', read_user_submissions, user_id)
+        bookings, status_msg = await run_with_status(
+            target,
+            'Загружаем ваши записи…',
+            read_user_submissions,
+            user_id,
+            keep_status=True,
+        )
     except Exception:
         logger.exception('Ошибка при чтении записей пользователя')
         await target.answer('Не удалось загрузить ваши записи. Попробуйте позже.')
         return
 
     if not bookings:
-        await target.answer(
+        await edit_or_answer(
+            status_msg,
             'У вас пока нет записей на экскурсии.',
             reply_markup=back_to_menu_keyboard(),
         )
@@ -1482,7 +1530,11 @@ async def show_my_bookings(target: Message, user_id: int) -> None:
             ])
 
     keyboard_rows.append([InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')])
-    await target.answer('\n'.join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows))
+    await edit_or_answer(
+        status_msg,
+        '\n'.join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
 
 
 async def ensure_consent_pd_in_state(state: FSMContext, user_id: int) -> bool:
@@ -1896,7 +1948,7 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     phone_display = format_belarus_phone(phone)
 
     try:
-        saved = await run_with_status(
+        saved, status_msg = await run_with_status(
             message,
             'Уже записываем вас на экскурсию…',
             save_user_booking,
@@ -1908,6 +1960,7 @@ async def process_phone(message: Message, state: FSMContext) -> None:
             name,
             phone,
             submission_ts,
+            keep_status=True,
         )
     except Exception:
         logger.exception('Ошибка при сохранении заявки в Google Sheets')
@@ -1915,12 +1968,13 @@ async def process_phone(message: Message, state: FSMContext) -> None:
         return
 
     if not saved:
-        await message.answer('На выбранную дату мест уже нет. Выберите другую дату.')
+        await edit_or_answer(status_msg, 'На выбранную дату мест уже нет. Выберите другую дату.')
         await state.set_state(None)
         await send_dates_menu(message, message_text='Выберите другую дату:')
         return
 
-    await message.answer(
+    await edit_or_answer(
+        status_msg,
         format_booking_confirmation_text(chosen_date, name, phone_display),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='Записаться еще', callback_data='new_submission')],
@@ -1939,12 +1993,13 @@ async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) ->
     user_id = callback.from_user.id
 
     try:
-        cancelled = await run_with_status(
+        cancelled, status_msg = await run_with_status(
             callback.message,
             'Отменяем вашу запись…',
             cancel_user_booking,
             user_id,
             submission_ts,
+            keep_status=True,
         )
     except Exception:
         logger.exception('Ошибка при отмене записи')
@@ -1952,7 +2007,8 @@ async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) ->
         return
 
     if cancelled is None:
-        await callback.message.answer(
+        await edit_or_answer(
+            status_msg,
             'Эта запись уже отменена или не найдена.',
             reply_markup=back_to_menu_keyboard(),
         )
@@ -1962,7 +2018,7 @@ async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) ->
         [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
         [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
     ])
-    await callback.message.answer(BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
+    await edit_or_answer(status_msg, BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == 'new_submission')
