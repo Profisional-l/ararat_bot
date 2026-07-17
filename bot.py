@@ -9,8 +9,9 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set, TypeVar, Union
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -102,6 +103,12 @@ NO_SUITABLE_DATE_TEXT = (
     'Не нашли подходящую дату? Вы можете пройти экскурсию самостоятельно! '
     'Еще больше интересных маршрутов вы найдете в карте от ARARAT!'
 )
+NO_DATES_AVAILABLE_TEXT = (
+    'Все предложенные места уже разобраны! Мы очень рады, что вам хочется открывать '
+    'новые грани города вместе с ARARAT, и уже готовим для вас новые возможности для участия. '
+    'Следите за обновлениями!\n\n'
+    'Вы также можете получить карту с авторскими маршрутами в материалах о проекте'
+)
 MAILING_PROMPT_TEXT = 'Хотите первыми узнавать новости проекта и получать эксклюзивные материалы?'
 BOOKING_CANCELLED_TEXT = (
     'Ваша запись отменена! Будем рады видеть вас на новых экскурсиях от ARARAT!\n'
@@ -111,6 +118,10 @@ EXCURSION_MEETING_PLACE = os.getenv(
     'EXCURSION_MEETING_PLACE',
     'у кафе «Осмоловка» (ул. Киселева, 23)',
 ).strip()
+REMINDER_CHECK_INTERVAL_SEC = int(os.getenv('REMINDER_CHECK_INTERVAL_SEC', '1800'))
+REMINDER_HOUR_LOCAL = int(os.getenv('REMINDER_HOUR_LOCAL', '10'))
+REMINDER_LOG_FILE = os.getenv('REMINDER_LOG_FILE', 'reminder_sent.csv').strip()
+EXCURSION_TIMEZONE = os.getenv('EXCURSION_TIMEZONE', 'Europe/Minsk').strip()
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -485,6 +496,7 @@ class UserProfile:
 
 @dataclass
 class UserBooking:
+    user_id: int
     chosen_date: str
     name: str
     phone: str
@@ -999,6 +1011,7 @@ def read_user_submissions(user_id: int) -> List[UserBooking]:
             continue
         bookings.append(
             UserBooking(
+                user_id=user_id,
                 chosen_date=chosen_date,
                 name=row[5].strip() if len(row) > 5 else '',
                 phone=row[6].strip() if len(row) > 6 else '',
@@ -1008,6 +1021,187 @@ def read_user_submissions(user_id: int) -> List[UserBooking]:
 
     bookings.sort(key=lambda item: item.submission_timestamp or item.chosen_date, reverse=True)
     return bookings
+
+
+def read_all_submissions() -> List[UserBooking]:
+    worksheet = get_worksheet('Submissions')
+    rows = worksheet.get_all_values()
+    bookings: List[UserBooking] = []
+
+    for row in rows[1:] if rows else []:
+        if not row or not str(row[0]).strip().isdigit():
+            continue
+        if len(row) < 8:
+            continue
+        chosen_date = row[4].strip()
+        if not chosen_date:
+            continue
+        bookings.append(
+            UserBooking(
+                user_id=int(row[0]),
+                chosen_date=chosen_date,
+                name=row[5].strip() if len(row) > 5 else '',
+                phone=row[6].strip() if len(row) > 6 else '',
+                submission_timestamp=row[7].strip() if len(row) > 7 else '',
+            )
+        )
+    return bookings
+
+
+def _reminder_key(user_id: int, submission_ts: str) -> str:
+    return f'{user_id}|{submission_ts}'
+
+
+def load_sent_reminders() -> Set[str]:
+    path = resolve_asset_path(REMINDER_LOG_FILE)
+    if not os.path.exists(path):
+        return set()
+
+    sent: Set[str] = set()
+    with open(path, mode='r', encoding='utf-8', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            user_id = (row.get('user_id') or '').strip()
+            submission_ts = (row.get('submission_timestamp') or '').strip()
+            if user_id.isdigit() and submission_ts:
+                sent.add(_reminder_key(int(user_id), submission_ts))
+    return sent
+
+
+def mark_reminder_sent(user_id: int, submission_ts: str) -> None:
+    path = resolve_asset_path(REMINDER_LOG_FILE)
+    file_exists = os.path.exists(path)
+    with open(path, mode='a', encoding='utf-8', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        if not file_exists:
+            writer.writerow(['user_id', 'submission_timestamp', 'sent_at'])
+        writer.writerow([user_id, submission_ts, utc_now_iso()])
+
+
+def get_excursion_local_tz() -> timezone:
+    try:
+        return ZoneInfo(EXCURSION_TIMEZONE)
+    except Exception:
+        logger.warning(
+            'Не удалось загрузить часовой пояс %s, используем UTC+3',
+            EXCURSION_TIMEZONE,
+        )
+        return timezone(timedelta(hours=3))
+
+
+def parse_booking_excursion_dt(chosen_date: str) -> Optional[datetime]:
+    label = chosen_date.strip()
+    if not label:
+        return None
+    if ' ' in label:
+        date_part, time_part = label.split(None, 1)
+    else:
+        date_part, time_part = label, ''
+    return parse_excursion_datetime(date_part, time_part)
+
+
+def format_reminder_text(booking: UserBooking) -> str:
+    date_display = format_excursion_confirmation_date(booking.chosen_date)
+    time_display = format_excursion_confirmation_time(booking.chosen_date)
+    meeting = EXCURSION_MEETING_PLACE
+    if time_display:
+        when_line = f'Будем ждать вас завтра в {time_display}, {meeting}.'
+    else:
+        when_line = f'Будем ждать вас завтра, {meeting}.'
+
+    return (
+        f'Напоминаем: завтра у вас экскурсия ARARAT!\n'
+        f'Дата: {date_display}\n'
+        f'Имя: {booking.name}\n\n'
+        f'{when_line}\n\n'
+        'Пожалуйста, подтвердите участие:'
+    )
+
+
+def reminder_keyboard(submission_ts: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Подтверждаю', callback_data=f'remind_yes_{submission_ts}')],
+        [InlineKeyboardButton(text='Не смогу прийти', callback_data=f'remind_no_{submission_ts}')],
+    ])
+
+
+def bookings_for_tomorrow_reminder(bookings: List[UserBooking], today_local: date) -> List[UserBooking]:
+    tomorrow = today_local + timedelta(days=1)
+    result: List[UserBooking] = []
+    for booking in bookings:
+        excursion_dt = parse_booking_excursion_dt(booking.chosen_date)
+        if excursion_dt is None:
+            continue
+        if excursion_dt.date() == tomorrow:
+            result.append(booking)
+    return result
+
+
+async def send_upcoming_reminders() -> None:
+    tz = get_excursion_local_tz()
+    now_local = datetime.now(tz)
+    if now_local.hour < REMINDER_HOUR_LOCAL:
+        return
+
+    try:
+        bookings = await run_sync(read_all_submissions)
+    except Exception:
+        logger.exception('Не удалось прочитать заявки для напоминаний')
+        return
+
+    due = bookings_for_tomorrow_reminder(bookings, now_local.date())
+    if not due:
+        return
+
+    try:
+        already_sent = await run_sync(load_sent_reminders)
+    except Exception:
+        logger.exception('Не удалось прочитать лог напоминаний')
+        already_sent = set()
+
+    for booking in due:
+        if not booking.submission_timestamp:
+            continue
+        key = _reminder_key(booking.user_id, booking.submission_timestamp)
+        if key in already_sent:
+            continue
+
+        try:
+            await bot.send_message(
+                booking.user_id,
+                format_reminder_text(booking),
+                reply_markup=reminder_keyboard(booking.submission_timestamp),
+            )
+            await run_sync(mark_reminder_sent, booking.user_id, booking.submission_timestamp)
+            already_sent.add(key)
+            logger.info(
+                'Напоминание отправлено пользователю %s на %s',
+                booking.user_id,
+                booking.chosen_date,
+            )
+        except Exception as exc:
+            if is_unreachable_subscriber_error(exc):
+                logger.warning('Не удалось отправить напоминание %s: чат недоступен', booking.user_id)
+                await run_sync(mark_reminder_sent, booking.user_id, booking.submission_timestamp)
+                already_sent.add(key)
+            else:
+                logger.exception('Ошибка при отправке напоминания пользователю %s', booking.user_id)
+        await asyncio.sleep(0.05)
+
+
+async def reminder_scheduler() -> None:
+    logger.info(
+        'Планировщик напоминаний запущен (интервал %s с, с %s:00 %s)',
+        REMINDER_CHECK_INTERVAL_SEC,
+        REMINDER_HOUR_LOCAL,
+        EXCURSION_TIMEZONE,
+    )
+    while True:
+        try:
+            await send_upcoming_reminders()
+        except Exception:
+            logger.exception('Сбой в планировщике напоминаний')
+        await asyncio.sleep(REMINDER_CHECK_INTERVAL_SEC)
 
 
 def cancel_user_booking(user_id: int, submission_ts: str) -> Optional[UserBooking]:
@@ -1023,6 +1217,7 @@ def cancel_user_booking(user_id: int, submission_ts: str) -> Optional[UserBookin
         if row_ts != submission_ts:
             continue
         booking = UserBooking(
+            user_id=user_id,
             chosen_date=row[4].strip(),
             name=row[5].strip() if len(row) > 5 else '',
             phone=row[6].strip() if len(row) > 6 else '',
@@ -1122,6 +1317,13 @@ async def resolve_main_menu_keyboard(user_id: Optional[int] = None) -> InlineKey
 
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
+    ])
+
+
+def no_dates_available_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
         [InlineKeyboardButton(text='Назад в меню', callback_data='main_menu')],
     ])
 
@@ -1424,7 +1626,11 @@ async def send_dates_menu(target: Message, message_text: str = SELECT_DATE_TEXT)
 
     keyboard = build_dates_keyboard(dates)
     if keyboard is None:
-        await edit_or_answer(status_msg, 'Пока нет свободных дат. Пожалуйста, зайдите позже.')
+        await edit_or_answer(
+            status_msg,
+            NO_DATES_AVAILABLE_TEXT,
+            reply_markup=no_dates_available_keyboard(),
+        )
         return False
 
     await edit_or_answer(status_msg, message_text, reply_markup=keyboard)
@@ -1476,7 +1682,11 @@ async def continue_booking_for_user(
             dates = await run_sync(read_available_dates)
             keyboard = build_dates_keyboard(dates)
             if keyboard is None:
-                await edit_or_answer(status_msg, 'Пока нет свободных дат. Пожалуйста, зайдите позже.')
+                await edit_or_answer(
+                    status_msg,
+                    NO_DATES_AVAILABLE_TEXT,
+                    reply_markup=no_dates_available_keyboard(),
+                )
                 await callback.answer()
                 return
 
@@ -1986,6 +2196,50 @@ async def process_phone(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
 
 
+@dp.callback_query(F.data.startswith('remind_yes_'), StateFilter('*'))
+async def callback_remind_yes(callback: CallbackQuery) -> None:
+    await callback.answer('Спасибо! Ждём вас на экскурсии.')
+    await callback.message.answer(
+        'Отлично, участие подтверждено! До встречи на экскурсии ARARAT.',
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith('remind_no_'), StateFilter('*'))
+async def callback_remind_no(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    submission_ts = callback.data.removeprefix('remind_no_')
+    user_id = callback.from_user.id
+
+    try:
+        cancelled, status_msg = await run_with_status(
+            callback.message,
+            'Отменяем вашу запись…',
+            cancel_user_booking,
+            user_id,
+            submission_ts,
+            keep_status=True,
+        )
+    except Exception:
+        logger.exception('Ошибка при отмене записи из напоминания')
+        await callback.message.answer('Не удалось отменить запись. Попробуйте позже.')
+        return
+
+    if cancelled is None:
+        await edit_or_answer(
+            status_msg,
+            'Эта запись уже отменена или не найдена.',
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
+        [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
+    ])
+    await edit_or_answer(status_msg, BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
+
+
 @dp.callback_query(F.data.startswith('cancel_'), StateFilter('*'))
 async def callback_cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
@@ -2060,6 +2314,11 @@ async def fallback_message(message: Message, state: FSMContext) -> None:
     await navigate_to_main_menu(message, state)
 
 
+async def on_startup() -> None:
+    asyncio.create_task(reminder_scheduler())
+
+
 if __name__ == '__main__':
     logger.info('Запуск бота...')
+    dp.startup.register(on_startup)
     dp.run_polling(bot)

@@ -2,6 +2,7 @@ credentials.json
 araratbot-*.json
 .env
 consent_pd_log.csv
+reminder_sent.csv
 __pycache__/
 *.pyc
 .serv.env
