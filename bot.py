@@ -60,7 +60,7 @@ from aiogram.types import (
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from oauth2client.service_account import ServiceAccountCredentials
-from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectionError as RequestsConnectionError, SSLError as RequestsSSLError
 
 # ================== Настройки / конфигурация ==================
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
@@ -121,6 +121,7 @@ EXCURSION_MEETING_PLACE = os.getenv(
 REMINDER_CHECK_INTERVAL_SEC = int(os.getenv('REMINDER_CHECK_INTERVAL_SEC', '1800'))
 REMINDER_HOUR_LOCAL = int(os.getenv('REMINDER_HOUR_LOCAL', '10'))
 REMINDER_LOG_FILE = os.getenv('REMINDER_LOG_FILE', 'reminder_sent.csv').strip()
+REMINDER_RESPONSES_FILE = os.getenv('REMINDER_RESPONSES_FILE', 'reminder_responses.csv').strip()
 EXCURSION_TIMEZONE = os.getenv('EXCURSION_TIMEZONE', 'Europe/Minsk').strip()
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL', '').strip()
 WELCOME_IMAGE_FILE = os.getenv('WELCOME_IMAGE_FILE', 'img/1.jpg').strip()
@@ -511,6 +512,9 @@ class BookingStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_broadcast_content = State()
+    waiting_notify_date = State()
+    waiting_notify_username = State()
+    waiting_notify_content = State()
 
 
 # ================== Google Sheets ==================
@@ -568,7 +572,14 @@ def with_sheets_retry(func: Callable[..., T]) -> Callable[..., T]:
                     retry_after,
                 )
                 time.sleep(retry_after)
-            except (RequestsConnectionError, socket.gaierror, TimeoutError, OSError) as exc:
+            except (
+                RequestsConnectionError,
+                RequestsSSLError,
+                ssl.SSLError,
+                socket.gaierror,
+                TimeoutError,
+                OSError,
+            ) as exc:
                 last_error = exc
                 _reset_spreadsheet_cache()
                 if attempt >= SHEETS_RETRY_ATTEMPTS:
@@ -665,6 +676,11 @@ def get_worksheet(title: str):
     return worksheet
 
 
+@with_sheets_retry
+def worksheet_get_all_values(title: str) -> List[List[str]]:
+    return get_worksheet(title).get_all_values()
+
+
 def _is_header_row(value: str) -> bool:
     normalized = value.strip().lower()
     return normalized in {'date', 'дата', 'title', 'заголовок', 'user_id', 'time', 'время'}
@@ -680,8 +696,7 @@ def _parse_max_slots(raw_value: str) -> Optional[int]:
 
 
 def count_bookings_by_date() -> Dict[str, int]:
-    worksheet = get_worksheet('Submissions')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Submissions')
     counts: Dict[str, int] = {}
     for row in rows[1:] if rows else []:
         if len(row) < 5:
@@ -699,8 +714,7 @@ def read_available_dates() -> List[ExcursionDate]:
         return _dates_cache[0]
 
     logger.info('Чтение доступных дат из Google Sheets')
-    worksheet = get_worksheet('Dates')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Dates')
     booking_counts = count_bookings_by_date()
 
     dates: List[ExcursionDate] = []
@@ -738,8 +752,7 @@ CONTENT_IGNORED_TITLES = {'о бренде ararat'}
 
 def read_content_items() -> List[ContentItem]:
     logger.info('Чтение контента из Google Sheets')
-    worksheet = get_worksheet('Content')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Content')
 
     items: List[ContentItem] = []
     for index, row in enumerate(rows):
@@ -840,8 +853,8 @@ def save_user_booking(
 
 
 def upsert_mailing_subscriber(user_id: int, username: str, subscribed_at: str) -> None:
+    rows = worksheet_get_all_values('MailingList')
     worksheet = get_worksheet('MailingList')
-    rows = worksheet.get_all_values()
     for row_index, row in enumerate(rows[1:], start=2):
         if row and str(row[0]).strip() == str(user_id):
             worksheet.update(f'B{row_index}:C{row_index}', [[username or '', subscribed_at]])
@@ -850,8 +863,7 @@ def upsert_mailing_subscriber(user_id: int, username: str, subscribed_at: str) -
 
 
 def read_mailing_subscribers() -> List[int]:
-    worksheet = get_worksheet('MailingList')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('MailingList')
     subscribers: List[int] = []
     for row in rows[1:] if rows else []:
         if not row or not str(row[0]).strip().isdigit():
@@ -861,8 +873,8 @@ def read_mailing_subscribers() -> List[int]:
 
 
 def remove_mailing_subscriber(user_id: int) -> bool:
+    rows = worksheet_get_all_values('MailingList')
     worksheet = get_worksheet('MailingList')
-    rows = worksheet.get_all_values()
     for row_index, row in enumerate(rows[1:], start=2):
         if row and str(row[0]).strip() == str(user_id):
             worksheet.delete_rows(row_index)
@@ -900,8 +912,7 @@ def _row_to_user_profile(row: List[str]) -> UserProfile:
 
 
 def _profile_from_submissions(user_id: int) -> Optional[UserProfile]:
-    worksheet = get_worksheet('Submissions')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Submissions')
     latest_row: Optional[List[str]] = None
     for row in rows[1:] if rows else []:
         if row and str(row[0]).strip() == str(user_id):
@@ -921,8 +932,7 @@ def _profile_from_submissions(user_id: int) -> Optional[UserProfile]:
 
 
 def _load_user_profile(user_id: int) -> Optional[UserProfile]:
-    worksheet = get_worksheet('Users')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Users')
     for row in rows[1:] if rows else []:
         if row and str(row[0]).strip() == str(user_id):
             return _row_to_user_profile(row)
@@ -947,8 +957,8 @@ def upsert_user_profile(
     consent_pd_at: Optional[str] = None,
     consent_mailing: Optional[str] = None,
 ) -> UserProfile:
+    rows = worksheet_get_all_values('Users')
     worksheet = get_worksheet('Users')
-    rows = worksheet.get_all_values()
     updated_at = utc_now_iso()
     existing: Optional[UserProfile] = None
 
@@ -997,8 +1007,7 @@ def upsert_user_profile(
 
 
 def read_user_submissions(user_id: int) -> List[UserBooking]:
-    worksheet = get_worksheet('Submissions')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Submissions')
     bookings: List[UserBooking] = []
 
     for row in rows[1:] if rows else []:
@@ -1024,8 +1033,7 @@ def read_user_submissions(user_id: int) -> List[UserBooking]:
 
 
 def read_all_submissions() -> List[UserBooking]:
-    worksheet = get_worksheet('Submissions')
-    rows = worksheet.get_all_values()
+    rows = worksheet_get_all_values('Submissions')
     bookings: List[UserBooking] = []
 
     for row in rows[1:] if rows else []:
@@ -1048,7 +1056,72 @@ def read_all_submissions() -> List[UserBooking]:
     return bookings
 
 
-def _reminder_key(user_id: int, submission_ts: str) -> str:
+def group_bookings_by_date(bookings: Optional[List[UserBooking]] = None) -> Dict[str, List[UserBooking]]:
+    if bookings is None:
+        bookings = read_all_submissions()
+
+    grouped: Dict[str, List[UserBooking]] = {}
+    for booking in bookings:
+        grouped.setdefault(booking.chosen_date, []).append(booking)
+    return dict(sorted(grouped.items(), key=lambda item: excursion_sort_key(item[0])))
+
+
+def read_user_ids_for_date(chosen_date: str) -> List[int]:
+    bookings = group_bookings_by_date().get(chosen_date, [])
+    unique_ids: List[int] = []
+    seen: Set[int] = set()
+    for booking in bookings:
+        if booking.user_id in seen:
+            continue
+        seen.add(booking.user_id)
+        unique_ids.append(booking.user_id)
+    return unique_ids
+
+
+def normalize_username(raw: str) -> str:
+    value = (raw or '').strip()
+    if value.startswith('@'):
+        value = value[1:]
+    return value.lower()
+
+
+def find_user_id_by_username(raw_username: str) -> Optional[int]:
+    username = normalize_username(raw_username)
+    if not username:
+        return None
+
+    # Users sheet — основной источник
+    for row in worksheet_get_all_values('Users')[1:]:
+        if not row or not str(row[0]).strip().isdigit():
+            continue
+        row_username = normalize_username(row[1] if len(row) > 1 else '')
+        if row_username == username:
+            return int(row[0])
+
+    # Submissions — на случай, если профиль ещё не в Users
+    for row in worksheet_get_all_values('Submissions')[1:]:
+        if not row or not str(row[0]).strip().isdigit():
+            continue
+        row_username = normalize_username(row[1] if len(row) > 1 else '')
+        if row_username == username:
+            return int(row[0])
+
+    # MailingList
+    for row in worksheet_get_all_values('MailingList')[1:]:
+        if not row or not str(row[0]).strip().isdigit():
+            continue
+        row_username = normalize_username(row[1] if len(row) > 1 else '')
+        if row_username == username:
+            return int(row[0])
+
+    return None
+
+
+def _reminder_key(user_id: int, chosen_date: str) -> str:
+    return f'{user_id}|{chosen_date}'
+
+
+def _reminder_legacy_key(user_id: int, submission_ts: str) -> str:
     return f'{user_id}|{submission_ts}'
 
 
@@ -1062,20 +1135,216 @@ def load_sent_reminders() -> Set[str]:
         reader = csv.DictReader(csvfile)
         for row in reader:
             user_id = (row.get('user_id') or '').strip()
+            if not user_id.isdigit():
+                continue
+            chosen_date = (row.get('chosen_date') or '').strip()
             submission_ts = (row.get('submission_timestamp') or '').strip()
-            if user_id.isdigit() and submission_ts:
-                sent.add(_reminder_key(int(user_id), submission_ts))
+            if chosen_date:
+                sent.add(_reminder_key(int(user_id), chosen_date))
+            if submission_ts:
+                sent.add(_reminder_legacy_key(int(user_id), submission_ts))
     return sent
 
 
-def mark_reminder_sent(user_id: int, submission_ts: str) -> None:
+def hydrate_sent_reminder_keys(sent: Set[str], bookings: List[UserBooking]) -> Set[str]:
+    """
+    Старый лог хранил только submission_timestamp.
+    Если по любой заявке user+date уже есть legacy-ключ — добавляем date-ключ,
+    чтобы после дедупа не ушло повторное напоминание.
+    """
+    hydrated = set(sent)
+    for booking in bookings:
+        if not booking.submission_timestamp:
+            continue
+        legacy = _reminder_legacy_key(booking.user_id, booking.submission_timestamp)
+        if legacy in hydrated:
+            hydrated.add(_reminder_key(booking.user_id, booking.chosen_date))
+    return hydrated
+
+
+def migrate_reminder_log_chosen_dates(bookings: List[UserBooking]) -> None:
+    """Один раз дописывает chosen_date в старый reminder_sent.csv по заявкам."""
     path = resolve_asset_path(REMINDER_LOG_FILE)
+    if not os.path.exists(path):
+        return
+
+    ts_to_date: Dict[tuple, str] = {}
+    for booking in bookings:
+        if booking.submission_timestamp:
+            ts_to_date[(booking.user_id, booking.submission_timestamp)] = booking.chosen_date
+
+    with open(path, mode='r', encoding='utf-8', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if not rows:
+        return
+
+    new_header = ['user_id', 'chosen_date', 'submission_timestamp', 'sent_at']
+    needs_rewrite = 'chosen_date' not in fieldnames
+    updated_rows: List[Dict[str, str]] = []
+
+    for row in rows:
+        user_id = (row.get('user_id') or '').strip()
+        submission_ts = (row.get('submission_timestamp') or '').strip()
+        chosen_date = (row.get('chosen_date') or '').strip()
+        sent_at = (row.get('sent_at') or '').strip()
+
+        if not chosen_date and user_id.isdigit() and submission_ts:
+            looked_up = ts_to_date.get((int(user_id), submission_ts), '')
+            if looked_up:
+                chosen_date = looked_up
+                needs_rewrite = True
+
+        updated_rows.append(
+            {
+                'user_id': user_id,
+                'chosen_date': chosen_date,
+                'submission_timestamp': submission_ts,
+                'sent_at': sent_at,
+            }
+        )
+
+    if not needs_rewrite:
+        return
+
+    with open(path, mode='w', encoding='utf-8', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=new_header)
+        writer.writeheader()
+        writer.writerows(updated_rows)
+    logger.info('Лог напоминаний обновлён: дописан chosen_date для совместимости')
+
+
+def mark_reminder_sent(user_id: int, chosen_date: str, submission_ts: str = '') -> None:
+    path = resolve_asset_path(REMINDER_LOG_FILE)
+    new_header = ['user_id', 'chosen_date', 'submission_timestamp', 'sent_at']
+
+    if os.path.exists(path):
+        with open(path, mode='r', encoding='utf-8', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            old_fields = list(reader.fieldnames or [])
+            rows = list(reader)
+        if 'chosen_date' not in old_fields:
+            # Миграция старого лога user_id,submission_timestamp,sent_at
+            with open(path, mode='w', encoding='utf-8', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=new_header)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(
+                        {
+                            'user_id': (row.get('user_id') or '').strip(),
+                            'chosen_date': '',
+                            'submission_timestamp': (row.get('submission_timestamp') or '').strip(),
+                            'sent_at': (row.get('sent_at') or '').strip(),
+                        }
+                    )
+
     file_exists = os.path.exists(path)
     with open(path, mode='a', encoding='utf-8', newline='') as csvfile:
         writer = csv.writer(csvfile)
         if not file_exists:
-            writer.writerow(['user_id', 'submission_timestamp', 'sent_at'])
-        writer.writerow([user_id, submission_ts, utc_now_iso()])
+            writer.writerow(new_header)
+        writer.writerow([user_id, chosen_date, submission_ts, utc_now_iso()])
+
+
+def load_reminder_responses() -> Dict[str, Dict[str, str]]:
+    """Последний ответ пользователя на напоминание по ключу user_id|chosen_date."""
+    path = resolve_asset_path(REMINDER_RESPONSES_FILE)
+    if not os.path.exists(path):
+        return {}
+
+    responses: Dict[str, Dict[str, str]] = {}
+    with open(path, mode='r', encoding='utf-8', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            user_id = (row.get('user_id') or '').strip()
+            chosen_date = (row.get('chosen_date') or '').strip()
+            response = (row.get('response') or '').strip().lower()
+            if not user_id.isdigit() or not chosen_date or response not in {'yes', 'no'}:
+                continue
+            responses[_reminder_key(int(user_id), chosen_date)] = {
+                'user_id': user_id,
+                'username': (row.get('username') or '').strip(),
+                'chosen_date': chosen_date,
+                'submission_timestamp': (row.get('submission_timestamp') or '').strip(),
+                'response': response,
+                'responded_at': (row.get('responded_at') or '').strip(),
+            }
+    return responses
+
+
+def get_reminder_response(user_id: int, chosen_date: str) -> Optional[str]:
+    item = load_reminder_responses().get(_reminder_key(user_id, chosen_date))
+    if not item:
+        return None
+    return item.get('response')
+
+
+def save_reminder_response(
+    user_id: int,
+    chosen_date: str,
+    response: str,
+    *,
+    submission_ts: str = '',
+    username: str = '',
+) -> None:
+    normalized = response.strip().lower()
+    if normalized not in {'yes', 'no'}:
+        raise ValueError(f'Некорректный ответ напоминания: {response}')
+
+    path = resolve_asset_path(REMINDER_RESPONSES_FILE)
+    file_exists = os.path.exists(path)
+    with open(path, mode='a', encoding='utf-8', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        if not file_exists:
+            writer.writerow(
+                ['user_id', 'username', 'chosen_date', 'submission_timestamp', 'response', 'responded_at']
+            )
+        writer.writerow([user_id, username or '', chosen_date, submission_ts, normalized, utc_now_iso()])
+
+
+def build_reminder_confirmation_stats_lines() -> List[str]:
+    sent_path = resolve_asset_path(REMINDER_LOG_FILE)
+    responses = load_reminder_responses()
+
+    sent_by_date: Dict[str, Set[int]] = {}
+    if os.path.exists(sent_path):
+        with open(sent_path, mode='r', encoding='utf-8', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                user_id = (row.get('user_id') or '').strip()
+                chosen_date = (row.get('chosen_date') or '').strip()
+                if user_id.isdigit() and chosen_date:
+                    sent_by_date.setdefault(chosen_date, set()).add(int(user_id))
+
+    # Даты из ответов без chosen_date в старом sent-логе тоже учитываем
+    for item in responses.values():
+        chosen_date = item.get('chosen_date') or ''
+        user_id = item.get('user_id') or ''
+        if chosen_date and user_id.isdigit():
+            sent_by_date.setdefault(chosen_date, set()).add(int(user_id))
+
+    if not sent_by_date and not responses:
+        return ['Подтверждения напоминаний пока отсутствуют.']
+
+    lines = ['<b>Подтверждения напоминаний:</b>']
+    for chosen_date in sorted(sent_by_date.keys(), key=excursion_sort_key):
+        user_ids = sent_by_date[chosen_date]
+        yes_count = 0
+        no_count = 0
+        for user_id in user_ids:
+            response = responses.get(_reminder_key(user_id, chosen_date), {}).get('response')
+            if response == 'yes':
+                yes_count += 1
+            elif response == 'no':
+                no_count += 1
+        pending = max(len(user_ids) - yes_count - no_count, 0)
+        lines.append(
+            f'• {format_excursion_label(chosen_date)}: '
+            f'подтвердили {yes_count}, отказались {no_count}, без ответа {pending}'
+        )
+    return lines
 
 
 def get_excursion_local_tz() -> timezone:
@@ -1127,14 +1396,19 @@ def reminder_keyboard(submission_ts: str) -> InlineKeyboardMarkup:
 
 def bookings_for_tomorrow_reminder(bookings: List[UserBooking], today_local: date) -> List[UserBooking]:
     tomorrow = today_local + timedelta(days=1)
-    result: List[UserBooking] = []
+    # Один reminder на пару (user_id, chosen_date), даже если в таблице несколько строк.
+    best_by_key: Dict[tuple, UserBooking] = {}
     for booking in bookings:
         excursion_dt = parse_booking_excursion_dt(booking.chosen_date)
         if excursion_dt is None:
             continue
-        if excursion_dt.date() == tomorrow:
-            result.append(booking)
-    return result
+        if excursion_dt.date() != tomorrow:
+            continue
+        key = (booking.user_id, booking.chosen_date)
+        prev = best_by_key.get(key)
+        if prev is None or (booking.submission_timestamp or '') > (prev.submission_timestamp or ''):
+            best_by_key[key] = booking
+    return list(best_by_key.values())
 
 
 async def send_upcoming_reminders() -> None:
@@ -1154,7 +1428,10 @@ async def send_upcoming_reminders() -> None:
         return
 
     try:
+        # Сначала дописываем chosen_date в старый лог, затем читаем ключи.
+        await run_sync(migrate_reminder_log_chosen_dates, bookings)
         already_sent = await run_sync(load_sent_reminders)
+        already_sent = hydrate_sent_reminder_keys(already_sent, bookings)
     except Exception:
         logger.exception('Не удалось прочитать лог напоминаний')
         already_sent = set()
@@ -1162,8 +1439,21 @@ async def send_upcoming_reminders() -> None:
     for booking in due:
         if not booking.submission_timestamp:
             continue
-        key = _reminder_key(booking.user_id, booking.submission_timestamp)
-        if key in already_sent:
+        date_key = _reminder_key(booking.user_id, booking.chosen_date)
+        legacy_key = _reminder_legacy_key(booking.user_id, booking.submission_timestamp)
+
+        # Уже отправляли на эту дату (новый ключ) или по любой заявке этой даты (старый лог).
+        sibling_already_sent = any(
+            _reminder_legacy_key(item.user_id, item.submission_timestamp) in already_sent
+            for item in bookings
+            if (
+                item.user_id == booking.user_id
+                and item.chosen_date == booking.chosen_date
+                and item.submission_timestamp
+            )
+        )
+        if date_key in already_sent or legacy_key in already_sent or sibling_already_sent:
+            already_sent.add(date_key)
             continue
 
         try:
@@ -1172,8 +1462,14 @@ async def send_upcoming_reminders() -> None:
                 format_reminder_text(booking),
                 reply_markup=reminder_keyboard(booking.submission_timestamp),
             )
-            await run_sync(mark_reminder_sent, booking.user_id, booking.submission_timestamp)
-            already_sent.add(key)
+            await run_sync(
+                mark_reminder_sent,
+                booking.user_id,
+                booking.chosen_date,
+                booking.submission_timestamp,
+            )
+            already_sent.add(date_key)
+            already_sent.add(legacy_key)
             logger.info(
                 'Напоминание отправлено пользователю %s на %s',
                 booking.user_id,
@@ -1181,9 +1477,16 @@ async def send_upcoming_reminders() -> None:
             )
         except Exception as exc:
             if is_unreachable_subscriber_error(exc):
+                # Помечаем, чтобы не долбить недоступный чат каждые 30 минут.
                 logger.warning('Не удалось отправить напоминание %s: чат недоступен', booking.user_id)
-                await run_sync(mark_reminder_sent, booking.user_id, booking.submission_timestamp)
-                already_sent.add(key)
+                await run_sync(
+                    mark_reminder_sent,
+                    booking.user_id,
+                    booking.chosen_date,
+                    booking.submission_timestamp,
+                )
+                already_sent.add(date_key)
+                already_sent.add(legacy_key)
             else:
                 logger.exception('Ошибка при отправке напоминания пользователю %s', booking.user_id)
         await asyncio.sleep(0.05)
@@ -1206,8 +1509,8 @@ async def reminder_scheduler() -> None:
 
 def cancel_user_booking(user_id: int, submission_ts: str) -> Optional[UserBooking]:
     logger.info('Отмена заявки пользователя %s', user_id)
+    rows = worksheet_get_all_values('Submissions')
     worksheet = get_worksheet('Submissions')
-    rows = worksheet.get_all_values()
     for row_index, row in enumerate(rows[1:], start=2):
         if not row or str(row[0]).strip() != str(user_id):
             continue
@@ -1229,6 +1532,38 @@ def cancel_user_booking(user_id: int, submission_ts: str) -> Optional[UserBookin
         return booking
     logger.info('Заявка для отмены не найдена (пользователь %s)', user_id)
     return None
+
+
+def cancel_user_bookings_for_date(user_id: int, chosen_date: str) -> List[UserBooking]:
+    """Удаляет все строки пользователя на выбранную дату (на случай дублей в таблице)."""
+    logger.info('Отмена всех заявок пользователя %s на %s', user_id, chosen_date)
+    rows = worksheet_get_all_values('Submissions')
+    worksheet = get_worksheet('Submissions')
+    cancelled: List[UserBooking] = []
+    # Удаляем снизу вверх, чтобы индексы строк не съезжали.
+    for row_index in range(len(rows), 1, -1):
+        row = rows[row_index - 1]
+        if not row or str(row[0]).strip() != str(user_id):
+            continue
+        if len(row) < 8:
+            continue
+        if row[4].strip() != chosen_date:
+            continue
+        cancelled.append(
+            UserBooking(
+                user_id=user_id,
+                chosen_date=row[4].strip(),
+                name=row[5].strip() if len(row) > 5 else '',
+                phone=row[6].strip() if len(row) > 6 else '',
+                submission_timestamp=row[7].strip(),
+            )
+        )
+        worksheet.delete_rows(row_index)
+
+    if cancelled:
+        invalidate_dates_cache()
+        logger.info('Отменено заявок: %s (пользователь %s, дата %s)', len(cancelled), user_id, chosen_date)
+    return cancelled
 
 
 def user_has_completed_onboarding(profile: Optional[UserProfile]) -> bool:
@@ -1378,6 +1713,8 @@ async def send_broadcast_to_subscribers(
     source_message: Message,
     subscribers: List[int],
     album_messages: Optional[List[Message]] = None,
+    *,
+    remove_unreachable_from_mailing: bool = True,
 ) -> tuple[int, int, int]:
     sent = 0
     failed = 0
@@ -1399,11 +1736,11 @@ async def send_broadcast_to_subscribers(
             failed += 1
             if is_unreachable_subscriber_error(exc):
                 logger.warning(
-                    'Подписчик %s недоступен для рассылки (%s), удаляем из списка',
+                    'Получатель %s недоступен для рассылки (%s)',
                     user_id,
                     exc.message if hasattr(exc, 'message') else exc,
                 )
-                if await run_sync(remove_mailing_subscriber, user_id):
+                if remove_unreachable_from_mailing and await run_sync(remove_mailing_subscriber, user_id):
                     removed += 1
             else:
                 logger.exception('Не удалось отправить рассылку пользователю %s', user_id)
@@ -1417,16 +1754,45 @@ async def execute_broadcast(
     state: FSMContext,
     album_messages: Optional[List[Message]] = None,
 ) -> None:
-    try:
-        subscribers = await run_with_status(message, 'Подготавливаем рассылку…', read_mailing_subscribers)
-    except Exception:
-        logger.exception('Ошибка при чтении списка рассылки')
-        await message.answer('Не удалось получить список подписчиков.')
-        await state.clear()
-        return
+    data = await state.get_data()
+    audience = data.get('broadcast_audience', 'mailing')
+    notify_date = data.get('notify_date', '')
+    notify_user_id = data.get('notify_user_id')
+    notify_username = data.get('notify_username', '')
+
+    if audience == 'user' and notify_user_id:
+        subscribers = [int(notify_user_id)]
+        username_note = f' @{notify_username}' if notify_username else ''
+        audience_label = f'пользователю{username_note} (id {notify_user_id})'
+        remove_unreachable = False
+    elif audience == 'date' and notify_date:
+        try:
+            subscribers = await run_with_status(
+                message,
+                'Собираем участников выбранной даты…',
+                read_user_ids_for_date,
+                notify_date,
+            )
+        except Exception:
+            logger.exception('Ошибка при чтении участников даты для уведомления')
+            await message.answer('Не удалось получить список участников.')
+            await state.clear()
+            return
+        audience_label = f'участникам даты {format_excursion_label(notify_date)}'
+        remove_unreachable = False
+    else:
+        try:
+            subscribers = await run_with_status(message, 'Подготавливаем рассылку…', read_mailing_subscribers)
+        except Exception:
+            logger.exception('Ошибка при чтении списка рассылки')
+            await message.answer('Не удалось получить список подписчиков.')
+            await state.clear()
+            return
+        audience_label = 'подписчикам рассылки'
+        remove_unreachable = True
 
     if not subscribers:
-        await message.answer('Список подписчиков пуст.')
+        await message.answer('Список получателей пуст.')
         await state.clear()
         return
 
@@ -1435,15 +1801,23 @@ async def execute_broadcast(
         await state.clear()
         return
 
-    status_msg = await message.answer('Отправляем рассылку подписчикам…')
+    status_msg = await message.answer(f'Отправляем сообщение {audience_label}…')
     async with show_typing(message.chat.id):
-        sent, failed, removed = await send_broadcast_to_subscribers(message, subscribers, album_messages)
+        sent, failed, removed = await send_broadcast_to_subscribers(
+            message,
+            subscribers,
+            album_messages,
+            remove_unreachable_from_mailing=remove_unreachable,
+        )
 
     await delete_message_safe(message.chat.id, status_msg.message_id)
     album_note = ' (альбом)' if album_messages else ''
     removed_note = f', удалено из списка: {removed}' if removed else ''
     await message.answer(
-        f'Рассылка{album_note} завершена. Успешно: {sent}, ошибок: {failed}{removed_note}.'
+        f'Отправка{album_note} завершена.\n'
+        f'Аудитория: {audience_label}\n'
+        f'Получателей: {len(subscribers)}\n'
+        f'Успешно: {sent}, ошибок: {failed}{removed_note}.'
     )
     await state.clear()
 
@@ -1803,12 +2177,183 @@ async def cmd_broadcast(message: Message, state: FSMContext) -> None:
         return
 
     await state.set_state(AdminStates.waiting_broadcast_content)
+    await state.update_data(broadcast_audience='mailing', notify_date=None)
     await message.answer(
-        'Отправьте сообщение для рассылки:\n'
+        'Отправьте сообщение для рассылки подписчикам:\n'
         '• текст (HTML)\n'
         '• одно фото / видео / документ\n'
         '• альбом из нескольких фото или видео (выберите несколько и отправьте разом)\n\n'
         'Для отмены отправьте /cancel'
+    )
+
+
+@dp.message(Command(commands=['notify']))
+async def cmd_notify(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer('Команда доступна только администраторам.')
+        return
+
+    try:
+        grouped = await run_with_status(message, 'Загружаем записи…', group_bookings_by_date)
+    except Exception:
+        logger.exception('Ошибка при загрузке записей для /notify')
+        await message.answer('Не удалось загрузить записи.')
+        return
+
+    if not grouped:
+        await message.answer('Пока нет записей на экскурсии.')
+        return
+
+    builder = InlineKeyboardBuilder()
+    for date_label, bookings in grouped.items():
+        seats = len(bookings)
+        unique_users = len({item.user_id for item in bookings})
+        if seats == unique_users:
+            button_text = f'{format_excursion_label(date_label)} — {seats} чел.'
+        else:
+            button_text = f'{format_excursion_label(date_label)} — {seats} чел. ({unique_users} чатов)'
+        builder.button(text=button_text, callback_data=f'notify_date_{date_label}')
+    builder.button(text='Отмена', callback_data='notify_cancel')
+    builder.adjust(1)
+
+    await state.set_state(AdminStates.waiting_notify_date)
+    await message.answer(
+        'Выберите дату экскурсии — сообщение получат все записанные на неё '
+        '(по одному сообщению на Telegram-аккаунт):',
+        reply_markup=builder.as_markup(),
+    )
+
+
+async def start_notify_user_flow(message: Message, state: FSMContext, raw_username: str) -> None:
+    username = normalize_username(raw_username)
+    if not username:
+        await message.answer('Укажите username, например: /notify_user @ivan')
+        return
+
+    try:
+        user_id = await run_with_status(
+            message,
+            f'Ищем пользователя @{username}…',
+            find_user_id_by_username,
+            username,
+        )
+    except Exception:
+        logger.exception('Ошибка при поиске пользователя @%s', username)
+        await message.answer('Не удалось найти пользователя. Попробуйте позже.')
+        return
+
+    if user_id is None:
+        await message.answer(
+            f'Пользователь @{username} не найден в базе бота.\n'
+            'Он должен хотя бы раз написать боту (/start) или записаться на экскурсию.'
+        )
+        return
+
+    await state.set_state(AdminStates.waiting_notify_content)
+    await state.update_data(
+        broadcast_audience='user',
+        notify_user_id=user_id,
+        notify_username=username,
+        notify_date=None,
+    )
+    await message.answer(
+        f'Получатель: <b>@{username}</b> (id {user_id})\n\n'
+        'Отправьте сообщение:\n'
+        '• текст (можно со ссылкой через Ctrl+K)\n'
+        '• фото / видео / документ / альбом\n\n'
+        'Для отмены — /cancel'
+    )
+
+
+@dp.message(Command(commands=['notify_user']))
+async def cmd_notify_user(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer('Команда доступна только администраторам.')
+        return
+
+    parts = (message.text or '').split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        await start_notify_user_flow(message, state, parts[1])
+        return
+
+    await state.set_state(AdminStates.waiting_notify_username)
+    await message.answer(
+        'Отправьте username пользователя, например:\n'
+        '@ivan\n'
+        'или просто: ivan\n\n'
+        'Для отмены — /cancel'
+    )
+
+
+@dp.message(AdminStates.waiting_notify_username)
+async def process_notify_username(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    raw = (message.text or '').strip()
+    if not raw or raw.startswith('/'):
+        await message.answer('Отправьте username, например @ivan. Для отмены — /cancel')
+        return
+
+    await start_notify_user_flow(message, state, raw)
+
+
+@dp.callback_query(F.data == 'notify_cancel', StateFilter('*'))
+async def callback_notify_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer('Недостаточно прав.', show_alert=True)
+        return
+    await state.clear()
+    await callback.answer()
+    await callback.message.answer('Отправка участникам отменена.')
+
+
+@dp.callback_query(F.data.startswith('notify_date_'), AdminStates.waiting_notify_date)
+async def callback_notify_date(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer('Недостаточно прав.', show_alert=True)
+        return
+
+    chosen_date = callback.data.removeprefix('notify_date_')
+    try:
+        grouped = await run_sync(group_bookings_by_date)
+        bookings = grouped.get(chosen_date, [])
+        recipients: List[int] = []
+        seen: Set[int] = set()
+        for booking in bookings:
+            if booking.user_id in seen:
+                continue
+            seen.add(booking.user_id)
+            recipients.append(booking.user_id)
+    except Exception:
+        logger.exception('Ошибка при чтении участников даты')
+        await callback.answer()
+        await callback.message.answer('Не удалось получить участников этой даты.')
+        return
+
+    if not recipients:
+        await callback.answer()
+        await callback.message.answer('На эту дату пока никто не записан.')
+        return
+
+    seats = len(bookings)
+    await state.set_state(AdminStates.waiting_notify_content)
+    await state.update_data(
+        broadcast_audience='date',
+        notify_date=chosen_date,
+        notify_recipients_count=len(recipients),
+    )
+    await callback.answer()
+    await callback.message.answer(
+        f'Дата: <b>{format_excursion_label(chosen_date)}</b>\n'
+        f'Записей (мест): <b>{seats}</b>\n'
+        f'Получат сообщение: <b>{len(recipients)}</b> (уникальные чаты)\n\n'
+        'Отправьте сообщение для участников:\n'
+        '• текст (HTML)\n'
+        '• одно фото / видео / документ\n'
+        '• альбом из нескольких фото или видео\n\n'
+        'Для отмены — /cancel'
     )
 
 
@@ -1820,6 +2365,7 @@ async def cmd_stats(message: Message) -> None:
 
     try:
         dates = await run_with_status(message, 'Собираем статистику…', read_available_dates)
+        reminder_lines = await run_sync(build_reminder_confirmation_stats_lines)
     except Exception:
         logger.exception('Ошибка при чтении статистики')
         await message.answer('Не удалось получить статистику.')
@@ -1835,6 +2381,9 @@ async def cmd_stats(message: Message) -> None:
             lines.append(f'• {item.display_label}: записано {item.booked}')
         else:
             lines.append(f'• {item.display_label}: {item.booked}/{item.max_slots}')
+
+    lines.append('')
+    lines.extend(reminder_lines)
     await message.answer('\n'.join(lines))
 
 
@@ -2198,7 +2747,48 @@ async def process_phone(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith('remind_yes_'), StateFilter('*'))
 async def callback_remind_yes(callback: CallbackQuery) -> None:
+    submission_ts = callback.data.removeprefix('remind_yes_')
+    user_id = callback.from_user.id
+    username = callback.from_user.username or ''
+
+    try:
+        bookings = await run_sync(read_user_submissions, user_id)
+        matched = next((item for item in bookings if item.submission_timestamp == submission_ts), None)
+        if matched is None:
+            # Запись могла быть отменена, но подтверждение всё равно полезно зафиксировать нельзя без даты.
+            await callback.answer('Запись не найдена.', show_alert=True)
+            return
+
+        existing = await run_sync(get_reminder_response, user_id, matched.chosen_date)
+        if existing == 'yes':
+            await callback.answer('Вы уже подтвердили участие.')
+            await callback.message.answer(
+                'Участие уже подтверждено ранее. До встречи на экскурсии ARARAT!',
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+        if existing == 'no':
+            await callback.answer('Ранее вы отказались от участия.', show_alert=True)
+            return
+
+        await run_sync(
+            save_reminder_response,
+            user_id,
+            matched.chosen_date,
+            'yes',
+            submission_ts=submission_ts,
+            username=username,
+        )
+    except Exception:
+        logger.exception('Ошибка при сохранении подтверждения напоминания')
+        await callback.answer('Не удалось сохранить ответ. Попробуйте ещё раз.', show_alert=True)
+        return
+
     await callback.answer('Спасибо! Ждём вас на экскурсии.')
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await callback.message.answer(
         'Отлично, участие подтверждено! До встречи на экскурсии ARARAT.',
         reply_markup=back_to_menu_keyboard(),
@@ -2210,14 +2800,34 @@ async def callback_remind_no(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer()
     submission_ts = callback.data.removeprefix('remind_no_')
     user_id = callback.from_user.id
+    username = callback.from_user.username or ''
 
     try:
-        cancelled, status_msg = await run_with_status(
+        bookings = await run_sync(read_user_submissions, user_id)
+        matched = next((item for item in bookings if item.submission_timestamp == submission_ts), None)
+        if matched is None:
+            await callback.message.answer(
+                'Эта запись уже отменена или не найдена.',
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+
+        existing = await run_sync(get_reminder_response, user_id, matched.chosen_date)
+        if existing == 'no':
+            await callback.message.answer(
+                'Вы уже отказались от участия по этой дате.',
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+
+        # Одно напоминание = одна дата. Если с аккаунта несколько мест (семья/пара),
+        # «Не смогу прийти» снимает все места пользователя на эту дату.
+        cancelled_list, status_msg = await run_with_status(
             callback.message,
             'Отменяем вашу запись…',
-            cancel_user_booking,
+            cancel_user_bookings_for_date,
             user_id,
-            submission_ts,
+            matched.chosen_date,
             keep_status=True,
         )
     except Exception:
@@ -2225,7 +2835,7 @@ async def callback_remind_no(callback: CallbackQuery, state: FSMContext) -> None
         await callback.message.answer('Не удалось отменить запись. Попробуйте позже.')
         return
 
-    if cancelled is None:
+    if not cancelled_list:
         await edit_or_answer(
             status_msg,
             'Эта запись уже отменена или не найдена.',
@@ -2233,11 +2843,32 @@ async def callback_remind_no(callback: CallbackQuery, state: FSMContext) -> None
         )
         return
 
+    try:
+        await run_sync(
+            save_reminder_response,
+            user_id,
+            matched.chosen_date,
+            'no',
+            submission_ts=submission_ts,
+            username=username,
+        )
+    except Exception:
+        logger.exception('Запись отменена, но ответ напоминания не сохранился')
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    cancelled_note = ''
+    if len(cancelled_list) > 1:
+        cancelled_note = f'\n\nСнято записей: {len(cancelled_list)}.'
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='Материалы о проекте', callback_data='project_materials')],
         [InlineKeyboardButton(text='В главное меню', callback_data='main_menu')],
     ])
-    await edit_or_answer(status_msg, BOOKING_CANCELLED_TEXT, reply_markup=keyboard)
+    await edit_or_answer(status_msg, BOOKING_CANCELLED_TEXT + cancelled_note, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith('cancel_'), StateFilter('*'))
@@ -2296,6 +2927,26 @@ async def process_broadcast_content(message: Message, state: FSMContext) -> None
     if not is_broadcastable_message(message):
         await message.answer(
             'Отправьте текст, фото, видео, документ или аудио для рассылки.\n'
+            'Для отмены — /cancel'
+        )
+        return
+
+    if message.media_group_id:
+        await buffer_media_group_broadcast(message, state)
+        return
+
+    await execute_broadcast(message, state)
+
+
+@dp.message(AdminStates.waiting_notify_content)
+async def process_notify_content(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    if not is_broadcastable_message(message):
+        await message.answer(
+            'Отправьте текст, фото, видео, документ или аудио для участников.\n'
             'Для отмены — /cancel'
         )
         return

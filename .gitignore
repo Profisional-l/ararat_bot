@@ -3,6 +3,7 @@ araratbot-*.json
 .env
 consent_pd_log.csv
 reminder_sent.csv
+reminder_responses.csv
 __pycache__/
 *.pyc
 .serv.env
