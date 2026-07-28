@@ -116,7 +116,7 @@ BOOKING_CANCELLED_TEXT = (
 )
 EXCURSION_MEETING_PLACE = os.getenv(
     'EXCURSION_MEETING_PLACE',
-    'по адресу Киселева,2 (Площадь Победы)',
+    'по адресу Киселева 2 (Площадь Победы)',
 ).strip()
 REMINDER_CHECK_INTERVAL_SEC = int(os.getenv('REMINDER_CHECK_INTERVAL_SEC', '1800'))
 REMINDER_HOUR_LOCAL = int(os.getenv('REMINDER_HOUR_LOCAL', '10'))
