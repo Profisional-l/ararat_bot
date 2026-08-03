@@ -119,7 +119,7 @@ EXCURSION_MEETING_PLACE = os.getenv(
     'по адресу Киселева 2 (Площадь Победы)',
 ).strip()
 REMINDER_CHECK_INTERVAL_SEC = int(os.getenv('REMINDER_CHECK_INTERVAL_SEC', '1800'))
-REMINDER_HOUR_LOCAL = int(os.getenv('REMINDER_HOUR_LOCAL', '10'))
+REMINDER_HOUR_LOCAL = int(os.getenv('REMINDER_HOUR_LOCAL', '12'))
 REMINDER_LOG_FILE = os.getenv('REMINDER_LOG_FILE', 'reminder_sent.csv').strip()
 REMINDER_RESPONSES_FILE = os.getenv('REMINDER_RESPONSES_FILE', 'reminder_responses.csv').strip()
 EXCURSION_TIMEZONE = os.getenv('EXCURSION_TIMEZONE', 'Europe/Minsk').strip()
