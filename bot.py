@@ -326,7 +326,8 @@ def format_booking_confirmation_text(chosen_date: str, name: str, phone_display:
         f'Телефон: {phone_display}\n'
         f'{meeting_line}\n\n'
         f'Вопросы по экскурсии можно обсудить с {guide_link}\n'
-        'До встречи!'
+        'До встречи!\n'
+        'Обращаем ваше внимание, что участие в проекте доступно только для лиц старше 18 лет.'
     )
 
 
@@ -1440,7 +1441,8 @@ def format_reminder_confirmed_text(booking: UserBooking) -> str:
     return (
         f'{meeting_line}\n\n'
         f'Вопросы по экскурсии можно обсудить с {guide_link}\n'
-        'До встречи!'
+        'До встречи!\n'
+        'Обращаем ваше внимание, что участие в проекте доступно только для лиц старше 18 лет.'
     )
 
 
